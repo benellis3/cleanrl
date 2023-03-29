@@ -14,6 +14,9 @@ COPY poetry.lock poetry.lock
 RUN poetry install
 RUN poetry install --with atari
 RUN poetry install --with pybullet
+RUN poetry install -E "jax envpool"
+RUN poetry run pip install --upgrade "jax[cuda]==0.3.17" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+RUN poetry run python -c "import jax"
 
 # install mujoco_py
 RUN apt-get -y install wget unzip software-properties-common \
