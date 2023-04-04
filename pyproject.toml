@@ -176,5 +176,5 @@ c51_atari_jax = [
 ppo_atari_envpool_xla_jax_scan = [
     "ale-py", "AutoROM", "opencv-python", # atari
     "jax", "jaxlib", "flax", # jax
-    "envpool", # envpool
+    "envpool", "gymnax" # envpool
 ]

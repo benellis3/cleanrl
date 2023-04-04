@@ -95,11 +95,22 @@ def parse_args():
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
+    args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
     # fmt: on
     return args
 
 
-class VectorizedGymnaxWrapper(gymnax.utils.GymnaxWrapper):
+class GymnaxWrapper(object):
+    """Base class for Gymnax wrappers."""
+
+    def __init__(self, env):
+        self._env = env
+    
+    # provide proxy access to regular attributes of wrapped object
+    def __getattr__(self, name):
+        return getattr(self._env, name)
+
+class VectorizedGymnaxWrapper(GymnaxWrapper):
     """Always have this as the last wrapper to avoid vectorization confusion"""
 
     def __init__(self, env: environment.Environment, num_envs):
@@ -112,14 +123,14 @@ class VectorizedGymnaxWrapper(gymnax.utils.GymnaxWrapper):
         return jax.vmap(self._env.reset, (0, None))(keys, params)
 
     @partial(jax.jit, static_argnums=(0,))
-    def step_env(self, key, state, action, params):
+    def step(self, key, state, action, params):
         keys = jax.random.split(key, self.num_envs)
-        return jax.vmap(self._env.step_env, (0, 0, 0, None))(
+        return jax.vmap(self._env.step, (0, 0, 0, None))(
             keys, state, action, params
         )
 
 
-class EnvPoolAutoResetWrapper(gymnax.utils.GymnaxWrapper):
+class EnvPoolAutoResetWrapper(GymnaxWrapper):
     """Adds an EnvPool-style autoreset wrapper to gymnax environments: see https://github.com/sail-sg/envpool/issues/19"""
 
     def __init__(self, env: environment.Environment):
@@ -138,7 +149,7 @@ class EnvPoolAutoResetWrapper(gymnax.utils.GymnaxWrapper):
         return obs, state, reward, done, info
 
 
-class SignedRewardWrapper(gymnax.utils.GymnaxWrapper):
+class SignedRewardWrapper(GymnaxWrapper):
     def __init__(self, env: environment.Environment):
         super().__init__(env)
 
@@ -215,7 +226,8 @@ class AtariEncoder(nn.Module):
         )(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-
+        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
         return x
 
 
@@ -233,6 +245,7 @@ class MinAtarEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
+        
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
             x
         )
@@ -330,7 +343,7 @@ if __name__ == "__main__":
     # env setup
     envs = make_env(args.env_id, args.seed, args.num_envs)()
     minatar_envs, env_params = make_slow_env(
-        args.minatar_env_id, args.seed, args.minatar_num_envs
+        args.minatar_env_id, args.minatar_num_envs
     )()
     minatar_step_env = partial(minatar_envs.step, params=env_params)
 
@@ -341,10 +354,10 @@ if __name__ == "__main__":
         returned_episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
     )
     minatar_episode_stats = EpisodeStatistics(
-        episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
-        episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
-        returned_episode_returns=jnp.zeros(args.num_envs, dtype=jnp.float32),
-        returned_episode_lengths=jnp.zeros(args.num_envs, dtype=jnp.int32),
+        episode_returns=jnp.zeros(args.minatar_num_envs, dtype=jnp.float32),
+        episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
+        returned_episode_returns=jnp.zeros(args.minatar_num_envs, dtype=jnp.float32),
+        returned_episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
     )
     atari_handle, recv, send, step_env = envs.xla()
 
@@ -381,7 +394,7 @@ if __name__ == "__main__":
             episode_returns=(new_episode_return) * (1 - done),
             episode_lengths=(new_episode_length) * (1 - done),
             returned_episode_returns=jnp.where(
-                done, new_episode_return, episode_stats.return_episode_returns
+                done, new_episode_return, episode_stats.returned_episode_returns
             ),
             returned_episode_lengths=jnp.where(
                 done, new_episode_length, episode_stats.returned_episode_lengths
@@ -407,12 +420,13 @@ if __name__ == "__main__":
     body = SharedActorCriticBody()
     actor = Actor(action_dim=envs.single_action_space.n)
     critic = Critic()
+    key, init_key = jax.random.split(key)
     atari_params = atari_encoder.init(
         atari_key, np.array([envs.single_observation_space.sample()])
     )
     # TODO add observation space to wrappers
     minatar_params = minatar_encoder.init(
-        minatar_key, np.array([minatar_envs.observation_space.sample()])
+        minatar_key, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
     )
 
     body_params = body.init(
@@ -425,6 +439,8 @@ if __name__ == "__main__":
         apply_fn=None,
         params=AgentParams(
             atari_params,
+            minatar_params,
+            body_params,
             actor.init(
                 actor_key,
                 body.apply(
@@ -469,7 +485,8 @@ if __name__ == "__main__":
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        hidden = encoder.apply(agent_state.params.atari_params, next_obs)
+        params = agent_state.params.atari_params if not use_minatar else agent_state.params.minatar_params
+        hidden = encoder.apply(params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
         logits = actor.apply(agent_state.params.actor_params, hidden)
         # sample action: Gumbel-softmax trick
@@ -490,7 +507,8 @@ if __name__ == "__main__":
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        hidden = encoder.apply(params.atari_params, x)
+        encoder_params = params.atari_params if not use_minatar else params.minatar_params
+        hidden = encoder.apply(encoder_params, x)
         hidden = body.apply(params.body_params, hidden)
         logits = actor.apply(params.actor_params, hidden)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
@@ -524,12 +542,14 @@ if __name__ == "__main__":
         use_minatar: bool,
     ):
         encoder = atari_encoder if not use_minatar else minatar_encoder
+        encoder_params = agent_state.params.atari_params if not use_minatar else agent_state.params.minatar_params
+        num_envs = args.num_envs if not use_minatar else args.minatar_num_envs
         next_value = critic.apply(
             agent_state.params.critic_params,
-            encoder.apply(agent_state.params.atari_params, next_obs),
+            encoder.apply(encoder_params, next_obs),
         ).squeeze()
-
-        advantages = jnp.zeros((args.num_envs,))
+        
+        advantages = jnp.zeros((num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
         _, advantages = jax.lax.scan(
@@ -544,8 +564,8 @@ if __name__ == "__main__":
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns):
-        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a)
+    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, use_minatar):
+        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a, use_minatar)
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -571,11 +591,12 @@ if __name__ == "__main__":
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-    @jax.jit
+    @partial(jax.jit, static_argnums=(3,))
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
+        use_minatar: bool
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -593,7 +614,7 @@ if __name__ == "__main__":
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
 
-            def update_minibatch(agent_state, minibatch):
+            def update_minibatch(agent_state, minibatch, use_minatar):
                 (
                     loss,
                     (pg_loss, v_loss, entropy_loss, approx_kl),
@@ -604,6 +625,7 @@ if __name__ == "__main__":
                     minibatch.logprobs,
                     minibatch.advantages,
                     minibatch.returns,
+                    use_minatar
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (
@@ -615,6 +637,7 @@ if __name__ == "__main__":
                     grads,
                 )
 
+            update_minibatch_fn = partial(update_minibatch, use_minatar=use_minatar)
             agent_state, (
                 loss,
                 pg_loss,
@@ -622,7 +645,7 @@ if __name__ == "__main__":
                 entropy_loss,
                 approx_kl,
                 grads,
-            ) = jax.lax.scan(update_minibatch, agent_state, shuffled_storage)
+            ) = jax.lax.scan(update_minibatch_fn, agent_state, shuffled_storage)
             return (agent_state, key), (
                 loss,
                 pg_loss,
@@ -723,8 +746,8 @@ if __name__ == "__main__":
         elif args.rollout_selection_strategy == "atari":
             return False
         elif args.rollout_selection_strategy == "random":
-            sample = jax.random.random(key)
-            return sample < args.rollout_selection_prob
+            sample = jax.random.uniform(key)
+            return bool(sample < args.rollout_selection_prob)
 
     for update in range(1, args.num_updates + 1):
         update_time_start = time.time()
@@ -738,14 +761,14 @@ if __name__ == "__main__":
                 atari_next_done,
                 atari_storage,
                 key,
-                handle,
+                atari_handle,
             ) = rollout_atari(
                 agent_state,
                 atari_episode_stats,
                 atari_next_obs,
                 atari_next_done,
                 key,
-                handle,
+                atari_handle,
             )
             storage, next_obs, next_done = (
                 atari_storage,
@@ -787,6 +810,7 @@ if __name__ == "__main__":
             agent_state,
             storage,
             key,
+            prefix=="minatar"
         )
         episode_stats = (
             minatar_episode_stats if prefix == "minatar" else atari_episode_stats
