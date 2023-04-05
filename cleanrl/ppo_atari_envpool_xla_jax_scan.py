@@ -67,6 +67,7 @@ def parse_args():
         help="How to select when to switch between MinAtar and Atari")
     parser.add_argument("--rollout-selection-prob", type=float, default=0.8,
         help="The probability to select MinAtar or Atari. Only effective if the selection strategy is `random`")
+    parser.add_argument("--stop-selection-strategy", type=str, default="num_updates")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
@@ -669,6 +670,8 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
+    atari_step = 0
+    minatar_step
     start_time = time.time()
     atari_next_obs = envs.reset()
     key, reset_key = jax.random.split(key)
@@ -748,8 +751,18 @@ if __name__ == "__main__":
         elif args.rollout_selection_strategy == "random":
             sample = jax.random.uniform(key)
             return bool(sample < args.rollout_selection_prob)
+        else:
+            raise ValueError("Incorrect rollout selection strategy")
 
-    for update in range(1, args.num_updates + 1):
+    def stop_condition():
+        if args.stop_selection_strategy == "num_updates":
+            return update < args.num_updates + 1
+        elif args.stop_selection_strategy == "num_atari_steps":
+            return atari_step < args.total_timesteps + 1
+        else:
+            raise ValueError("Incorrect stop selection strategy")
+    update = 0
+    while stop_condition():
         update_time_start = time.time()
         key, rollout_key = jax.random.split(key)
         do_rollout_minatar = should_rollout_minatar(rollout_key)
@@ -803,6 +816,10 @@ if __name__ == "__main__":
             prefix = "minatar"
 
         global_step += args.num_steps * num_envs
+        if prefix == "minatar":
+            minatar_step += args.num_steps * num_envs
+        elif prefix == "atari":
+            atari_step += args.num_steps * num_envs
         storage = compute_gae(
             agent_state, next_obs, next_done, storage, use_minatar=do_rollout_minatar
         )
@@ -812,6 +829,7 @@ if __name__ == "__main__":
             key,
             prefix=="minatar"
         )
+        update += 1
         episode_stats = (
             minatar_episode_stats if prefix == "minatar" else atari_episode_stats
         )
@@ -826,6 +844,10 @@ if __name__ == "__main__":
         writer.add_scalar(
             f"charts/{prefix}_avg_episodic_return", avg_episodic_return, global_step
         )
+        writer.add_scalar(
+            "atari_step", atari_step, global_step
+        )
+        writer.add_scalar("minatar_step", minatar_step, global_step)
         writer.add_scalar(
             f"charts/{prefix}_avg_episodic_length",
             np.mean(jax.device_get(episode_stats.returned_episode_lengths)),
