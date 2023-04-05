@@ -5,7 +5,8 @@ import random
 import time
 from distutils.util import strtobool
 from functools import partial
-from typing import Sequence
+from typing import Sequence, Any, Callable
+
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -23,6 +24,8 @@ import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
+from flax import core
+from flax import struct
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -57,8 +60,10 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
-        help="the learning rate of the optimizer")
+    parser.add_argument("--atari-learning-rate", type=float, default=2.5e-4,
+        help="the learning rate of the optimizer for atari")
+    parser.add_argument("--minatar-learning-rate", type=float, default=2.5e-4,
+        help="The learning rate for minatar")
     parser.add_argument("--num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--minatar-num-envs", type=int, default=128, 
@@ -106,10 +111,11 @@ class GymnaxWrapper(object):
 
     def __init__(self, env):
         self._env = env
-    
+
     # provide proxy access to regular attributes of wrapped object
     def __getattr__(self, name):
         return getattr(self._env, name)
+
 
 class VectorizedGymnaxWrapper(GymnaxWrapper):
     """Always have this as the last wrapper to avoid vectorization confusion"""
@@ -126,9 +132,7 @@ class VectorizedGymnaxWrapper(GymnaxWrapper):
     @partial(jax.jit, static_argnums=(0,))
     def step(self, key, state, action, params):
         keys = jax.random.split(key, self.num_envs)
-        return jax.vmap(self._env.step, (0, 0, 0, None))(
-            keys, state, action, params
-        )
+        return jax.vmap(self._env.step, (0, 0, 0, None))(keys, state, action, params)
 
 
 class EnvPoolAutoResetWrapper(GymnaxWrapper):
@@ -227,7 +231,9 @@ class AtariEncoder(nn.Module):
         )(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+            x
+        )
         x = nn.relu(x)
         return x
 
@@ -246,7 +252,7 @@ class MinAtarEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
-        
+
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
             x
         )
@@ -280,6 +286,57 @@ def encode(is_atari, minatar_network, minatar_params, atari_network, atari_param
         minatar_network.apply(minatar_params, x),
         atari_network.apply(atari_params, x),
     )
+
+
+class DualOptimizerTrainState(struct.PyTreeNode):
+    step: int
+    apply_fn: Callable = struct.field(pytree_node=False)
+    params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
+    slow_tx: optax.GradientTransformation = struct.field(pytree_node=False)
+    slow_opt_state: optax.OptState = struct.field(pytree_node=True)
+    fast_tx: optax.GradientTransformation = struct.field(pytree_node=False)
+    fast_opt_state: optax.OptState = struct.field(pytree_node=True)
+
+    @partial(jax.jit, static_argnums=(3,))
+    def apply_gradients(self, *, grads, use_fast_tx, **kwargs):
+        tx = self.fast_tx if use_fast_tx else self.slow_tx
+        opt_state = self.fast_opt_state if use_fast_tx else self.slow_opt_state
+        updates, new_opt_state = tx.update(grads, opt_state, self.params)
+        new_params = optax.apply_updates(self.params, updates)
+        new_slow_opt_state = jax.tree_map(
+            lambda x, y: jax.lax.select(use_fast_tx, x, y),
+            self.slow_opt_state,
+            new_opt_state,
+        )
+        new_fast_opt_state = jax.tree_map(
+            lambda x, y: jax.lax.select(use_fast_tx, x, y),
+            new_opt_state,
+            self.fast_opt_state,
+        )
+
+        return self.replace(
+            step=self.step + 1,
+            params=new_params,
+            slow_opt_state=new_slow_opt_state,
+            fast_opt_state=new_fast_opt_state,
+            **kwargs,
+        )
+
+    @classmethod
+    def create(cls, *, apply_fn, params, slow_tx, fast_tx, **kwargs):
+        """Creates a new instance with `step=0` and initialized `opt_state`."""
+        slow_opt_state = slow_tx.init(params)
+        fast_opt_state = fast_tx.init(params)
+        return cls(
+            step=0,
+            apply_fn=apply_fn,
+            params=params,
+            slow_tx=slow_tx,
+            slow_opt_state=slow_opt_state,
+            fast_tx=fast_tx,
+            fast_opt_state=fast_opt_state,
+            **kwargs,
+        )
 
 
 @flax.struct.dataclass
@@ -407,14 +464,17 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Discrete
     ), "only discrete action space is supported"
 
-    def linear_schedule(count):
+    def linear_schedule(count, use_minatar):
         # anneal learning rate linearly after one training iteration which contains
         # (args.num_minibatches * args.update_epochs) gradient updates
         frac = (
             1.0
             - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
         )
-        return args.learning_rate * frac
+        learning_rate = (
+            args.atari_learning_rate if not use_minatar else args.minatar_learning_rate
+        )
+        return learning_rate * frac
 
     atari_encoder = AtariEncoder()
     minatar_encoder = MinAtarEncoder()
@@ -427,7 +487,8 @@ if __name__ == "__main__":
     )
     # TODO add observation space to wrappers
     minatar_params = minatar_encoder.init(
-        minatar_key, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+        minatar_key,
+        np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
     )
 
     body_params = body.init(
@@ -436,7 +497,7 @@ if __name__ == "__main__":
             atari_params, np.array([envs.single_observation_space.sample()])
         ),
     )
-    agent_state = TrainState.create(
+    agent_state = DualOptimizerTrainState.create(
         apply_fn=None,
         params=AgentParams(
             atari_params,
@@ -463,10 +524,21 @@ if __name__ == "__main__":
                 ),
             ),
         ),
-        tx=optax.chain(
+        slow_tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
-                learning_rate=linear_schedule if args.anneal_lr else args.learning_rate,
+                learning_rate=partial(linear_schedule, use_minatar=False)
+                if args.anneal_lr
+                else args.atari_learning_rate,
+                eps=1e-5,
+            ),
+        ),
+        fast_tx=optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.inject_hyperparams(optax.adam)(
+                learning_rate=partial(linear_schedule, use_minatar=True)
+                if args.anneal_lr
+                else args.minatar_learning_rate,
                 eps=1e-5,
             ),
         ),
@@ -486,7 +558,11 @@ if __name__ == "__main__":
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        params = agent_state.params.atari_params if not use_minatar else agent_state.params.minatar_params
+        params = (
+            agent_state.params.atari_params
+            if not use_minatar
+            else agent_state.params.minatar_params
+        )
         hidden = encoder.apply(params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
         logits = actor.apply(agent_state.params.actor_params, hidden)
@@ -508,7 +584,9 @@ if __name__ == "__main__":
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        encoder_params = params.atari_params if not use_minatar else params.minatar_params
+        encoder_params = (
+            params.atari_params if not use_minatar else params.minatar_params
+        )
         hidden = encoder.apply(encoder_params, x)
         hidden = body.apply(params.body_params, hidden)
         logits = actor.apply(params.actor_params, hidden)
@@ -543,13 +621,17 @@ if __name__ == "__main__":
         use_minatar: bool,
     ):
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        encoder_params = agent_state.params.atari_params if not use_minatar else agent_state.params.minatar_params
+        encoder_params = (
+            agent_state.params.atari_params
+            if not use_minatar
+            else agent_state.params.minatar_params
+        )
         num_envs = args.num_envs if not use_minatar else args.minatar_num_envs
         next_value = critic.apply(
             agent_state.params.critic_params,
             encoder.apply(encoder_params, next_obs),
         ).squeeze()
-        
+
         advantages = jnp.zeros((num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
         values = jnp.concatenate([storage.values, next_value[None, :]], axis=0)
@@ -597,7 +679,7 @@ if __name__ == "__main__":
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
-        use_minatar: bool
+        use_minatar: bool,
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -626,9 +708,11 @@ if __name__ == "__main__":
                     minibatch.logprobs,
                     minibatch.advantages,
                     minibatch.returns,
-                    use_minatar
+                    use_minatar,
                 )
-                agent_state = agent_state.apply_gradients(grads=grads)
+                agent_state = agent_state.apply_gradients(
+                    grads=grads, use_fast_tx=use_minatar
+                )
                 return agent_state, (
                     loss,
                     pg_loss,
@@ -761,6 +845,7 @@ if __name__ == "__main__":
             return atari_step < args.total_timesteps + 1
         else:
             raise ValueError("Incorrect stop selection strategy")
+
     update = 0
     while stop_condition():
         update_time_start = time.time()
@@ -824,10 +909,7 @@ if __name__ == "__main__":
             agent_state, next_obs, next_done, storage, use_minatar=do_rollout_minatar
         )
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-            agent_state,
-            storage,
-            key,
-            prefix=="minatar"
+            agent_state, storage, key, prefix == "minatar"
         )
         update += 1
         episode_stats = (
@@ -844,9 +926,7 @@ if __name__ == "__main__":
         writer.add_scalar(
             f"charts/{prefix}_avg_episodic_return", avg_episodic_return, global_step
         )
-        writer.add_scalar(
-            "atari_step", atari_step, global_step
-        )
+        writer.add_scalar("atari_step", atari_step, global_step)
         writer.add_scalar("minatar_step", minatar_step, global_step)
         writer.add_scalar(
             f"charts/{prefix}_avg_episodic_length",
@@ -855,7 +935,11 @@ if __name__ == "__main__":
         )
         writer.add_scalar(
             f"charts/{prefix}_learning_rate",
-            agent_state.opt_state[1].hyperparams["learning_rate"].item(),
+            getattr(
+                agent_state, f"{'slow' if prefix == 'atari' else 'fast'}_opt_state"
+            )[1]
+            .hyperparams["learning_rate"]
+            .item(),
             global_step,
         )
         writer.add_scalar("losses/value_loss", v_loss[-1, -1].item(), global_step)
