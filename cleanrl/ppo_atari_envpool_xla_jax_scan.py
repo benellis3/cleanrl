@@ -671,7 +671,7 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     atari_step = 0
-    minatar_step
+    minatar_step = 0
     start_time = time.time()
     atari_next_obs = envs.reset()
     key, reset_key = jax.random.split(key)
