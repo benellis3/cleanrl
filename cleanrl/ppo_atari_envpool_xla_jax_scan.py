@@ -60,6 +60,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
+    parser.add_argument("--total-minatar-steps", type=int, default=100000000)
     parser.add_argument("--atari-learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer for atari")
     parser.add_argument("--minatar-learning-rate", type=float, default=2.5e-4,
@@ -99,8 +100,11 @@ def parse_args():
         help="the target KL divergence threshold")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
+    args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_updates = args.total_timesteps // args.batch_size
+    args.num_minatar_updates = args.total_minatar_steps // args.minatar_batch_size
+    args.num_atari_updates = args.num_updates
     args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
     # fmt: on
     return args
@@ -297,7 +301,7 @@ class DualOptimizerTrainState(struct.PyTreeNode):
     fast_tx: optax.GradientTransformation = struct.field(pytree_node=False)
     fast_opt_state: optax.OptState = struct.field(pytree_node=True)
 
-    @partial(jax.jit, static_argnums=(3,))
+    @partial(jax.jit, static_argnames=["use_fast_tx"])
     def apply_gradients(self, *, grads, use_fast_tx, **kwargs):
         tx = self.fast_tx if use_fast_tx else self.slow_tx
         opt_state = self.fast_opt_state if use_fast_tx else self.slow_opt_state
@@ -464,13 +468,25 @@ if __name__ == "__main__":
         envs.single_action_space, gym.spaces.Discrete
     ), "only discrete action space is supported"
 
+    global_step = 0
+    atari_step = 0
+    minatar_step = 0
     def linear_schedule(count, use_minatar):
         # anneal learning rate linearly after one training iteration which contains
         # (args.num_minibatches * args.update_epochs) gradient updates
-        frac = (
-            1.0
-            - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
-        )
+        if args.stop_selection_strategy == "num_updates":
+            frac = (
+                1.0
+                - (count // (args.num_minibatches * args.update_epochs)) / args.num_updates
+            )
+        elif args.stop_selection_strategy == "num_atari_steps":
+            if args.rollout_selection_strategy == "minatar_first":
+                if use_minatar:
+                    frac = (1.0 - (count // (args.num_minibatches * args.update_epochs) / args.num_minatar_updates))
+                else:
+                    frac = (1.0 - (count // (args.num_minibatches * args.update_epochs) / args.num_atari_updates))
+            else:
+                frac = (1.0 - atari_step / args.total_timesteps)
         learning_rate = (
             args.atari_learning_rate if not use_minatar else args.minatar_learning_rate
         )
@@ -753,9 +769,7 @@ if __name__ == "__main__":
         return agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
-    atari_step = 0
-    minatar_step = 0
+    
     start_time = time.time()
     atari_next_obs = envs.reset()
     key, reset_key = jax.random.split(key)
@@ -835,6 +849,8 @@ if __name__ == "__main__":
         elif args.rollout_selection_strategy == "random":
             sample = jax.random.uniform(key)
             return bool(sample < args.rollout_selection_prob)
+        elif args.rollout_selection_strategy == "minatar_first":
+            return global_step < args.total_minatar_steps
         else:
             raise ValueError("Incorrect rollout selection strategy")
 
