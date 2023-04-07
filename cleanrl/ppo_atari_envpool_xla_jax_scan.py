@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument("--hf-entity", type=str, default="",
         help="the user or org name of the model repository from the Hugging Face Hub")
 
-    parser.add_argument("--transfer-environment", type="str", default="atari",
+    parser.add_argument("--transfer-environment", type=str, default="atari",
         help="The environment to transfer to (either atari or permuted MinAtar)")
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="Pong-v5",
@@ -100,6 +100,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--freeze-first-layer-on-transfer", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -140,12 +141,12 @@ class PermuteObservationGymnaxWrapper(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset_env(self, key, params):
-        obs, state = self.env.reset(key, params)
+        obs, state = self._env.reset(key, params)
         return self.permute_obs(obs), state
 
     @partial(jax.jit, static_argnums=(0,))
     def step_env(self, key, state, action, params):
-        obs, state, reward, done, info = self.env.step_env(key, state, action, params)
+        obs, state, reward, done, info = self._env.step_env(key, state, action, params)
         return self.permute_obs(obs), state, reward, done, info
 
 
@@ -425,19 +426,19 @@ if __name__ == "__main__":
     )
 
     # env setup
-    if args.transfer_environment == "atari":
-        envs = make_env(args.env_id, args.seed, args.transfer_num_envs)()
-    else:
-        key, permutation_key = jax.random.split(key)
-        permuted_minatar_envs, permuted_minatar_env_params = make_gymnax_env(
-            args.minatar_env_id,
-            args.transfer_num_envs,
-            permute_obs=True,
-            permutation_key=permutation_key,
-        )()
-        permuted_minatar_step_env = partial(
-            permuted_minatar_envs.step, params=permuted_minatar_env_params
-        )
+    # Define all three environments anyway just to avoid refactoring too much
+    envs = make_env(args.env_id, args.seed, args.transfer_num_envs)()
+    transfer_handle, recv, send, step_env = envs.xla()
+    key, permutation_key = jax.random.split(key)
+    permuted_minatar_envs, permuted_minatar_env_params = make_gymnax_env(
+        args.minatar_env_id,
+        args.transfer_num_envs,
+        permute_obs=True,
+        permutation_key=permutation_key,
+    )()
+    permuted_minatar_step_env = partial(
+        permuted_minatar_envs.step, params=permuted_minatar_env_params
+    )
 
     minatar_envs, env_params = make_gymnax_env(
         args.minatar_env_id, args.minatar_num_envs, permute_obs=False
@@ -456,7 +457,6 @@ if __name__ == "__main__":
         returned_episode_returns=jnp.zeros(args.minatar_num_envs, dtype=jnp.float32),
         returned_episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
     )
-    transfer_handle, recv, send, step_env = envs.xla()
 
     def step_env_wrappeed(episode_stats, key, handle, action):
         handle, (next_obs, reward, next_done, info) = step_env(handle, action)
@@ -484,7 +484,7 @@ if __name__ == "__main__":
         return episode_stats, handle, (next_obs, reward, next_done, info)
 
     def minatar_step_env_wrapped(
-        minatar_step_env_fn, episode_stats, key, env_state, action
+        episode_stats, key, env_state, action, minatar_step_env_fn
     ):
         obs, env_state, reward, done, info = minatar_step_env_fn(key, env_state, action)
         new_episode_return = episode_stats.episode_returns + info["reward"]
@@ -500,10 +500,6 @@ if __name__ == "__main__":
             ),
         )
         return episode_stats, env_state, (obs, reward, done, info)
-
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Discrete
-    ), "only discrete action space is supported"
 
     global_step = 0
     transfer_step = 0
@@ -542,7 +538,8 @@ if __name__ == "__main__":
     atari_encoder = AtariEncoder()
     minatar_encoder = MinAtarEncoder()
     body = SharedActorCriticBody()
-    actor = Actor(action_dim=envs.single_action_space.n)
+    action_dim = envs.single_action_space.n if args.transfer_environment == "atari" else minatar_envs.action_space.n
+    actor = Actor(action_dim=action_dim)
     critic = Critic()
     key, init_key = jax.random.split(key)
     atari_params = atari_encoder.init(
@@ -560,6 +557,19 @@ if __name__ == "__main__":
             atari_params, np.array([envs.single_observation_space.sample()])
         ),
     )
+    slow_opt = optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.inject_hyperparams(optax.adam)(
+                learning_rate=partial(linear_schedule, use_proxy=False)
+                if args.anneal_lr
+                else args.transfer_learning_rate,
+                eps=1e-5,
+            )
+    )
+    if args.freeze_first_layer_on_transfer:
+        slow_opt = optax.multi_transform({"encoder": slow_opt, "rest": optax.set_to_zero()},
+        params=AgentParams(atari_params={k:"encoder" for k in atari_params.keys()}, minatar_params={k:"encoder" for k in minatar_params.keys()},
+        body_params={k:"rest" for k in body_params.keys()}, actor_params={k:"rest" for k in actor_params.keys()}, critic_params={k:"rest" for k in critic_params.keys()}))
     agent_state = DualOptimizerTrainState.create(
         apply_fn=None,
         params=AgentParams(
@@ -587,7 +597,7 @@ if __name__ == "__main__":
                 ),
             ),
         ),
-        slow_tx=optax.chain(
+        slow_opt=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
                 learning_rate=partial(linear_schedule, use_proxy=False)
@@ -675,7 +685,7 @@ if __name__ == "__main__":
         compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda
     )
 
-    @partial(jax.jit, static_argnums=(4,))
+    @partial(jax.jit, static_argnames=["use_minatar", "use_proxy"])
     def compute_gae(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -738,12 +748,13 @@ if __name__ == "__main__":
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-    @partial(jax.jit, static_argnums=(3,))
+    @partial(jax.jit, static_argnames=["use_minatar", "use_proxy"])
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
         key: jax.random.PRNGKey,
         use_minatar: bool,
+        use_proxy: bool,
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -775,7 +786,7 @@ if __name__ == "__main__":
                     use_minatar,
                 )
                 agent_state = agent_state.apply_gradients(
-                    grads=grads, use_fast_tx=use_minatar
+                    grads=grads, use_fast_tx=use_proxy
                 )
                 return agent_state, (
                     loss,
@@ -930,11 +941,18 @@ if __name__ == "__main__":
         if args.stop_selection_strategy == "num_updates":
             return update < args.num_updates + 1
         elif args.stop_selection_strategy == "num_transfer_steps":
-            return transfer_step < args.total_timesteps + 1
+            return transfer_step < args.total_transfer_timesteps + 1
         else:
             raise ValueError("Incorrect stop selection strategy")
 
     update = 0
+    def freeze_encoder(agent_state):
+        assert args.transfer_environment == "minatar"
+        new_minatar_params = minatar_encoder.init(
+            minatar_key,
+            np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
+        )
+        
     while stop_condition():
         update_time_start = time.time()
         key, rollout_key = jax.random.split(key)
@@ -1002,8 +1020,9 @@ if __name__ == "__main__":
             use_proxy=do_rollout_minatar,
             use_minatar=use_minatar,
         )
+        use_minatar_ppo = prefix == "minatar" or args.transfer_environment == "minatar"
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-            agent_state, storage, key, prefix == "minatar"
+            agent_state, storage, key, use_minatar_ppo, use_proxy=prefix == "minatar"
         )
         update += 1
         episode_stats = (
@@ -1030,7 +1049,7 @@ if __name__ == "__main__":
         writer.add_scalar(
             f"charts/{prefix}_learning_rate",
             getattr(
-                agent_state, f"{'slow' if prefix == 'atari' else 'fast'}_opt_state"
+                agent_state, f"{'slow' if prefix == 'transfer' else 'fast'}_opt_state"
             )[1]
             .hyperparams["learning_rate"]
             .item(),
