@@ -100,7 +100,7 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--freeze-first-layer-on-transfer", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True)
+    parser.add_argument("--freeze-first-layer-on-transfer", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="Determines whether to freeze the encoder when transferring to a new environment")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -538,7 +538,11 @@ if __name__ == "__main__":
     atari_encoder = AtariEncoder()
     minatar_encoder = MinAtarEncoder()
     body = SharedActorCriticBody()
-    action_dim = envs.single_action_space.n if args.transfer_environment == "atari" else minatar_envs.action_space.n
+    action_dim = (
+        envs.single_action_space.n
+        if args.transfer_environment == "atari"
+        else minatar_envs.action_space.n
+    )
     actor = Actor(action_dim=action_dim)
     critic = Critic()
     key, init_key = jax.random.split(key)
@@ -557,55 +561,62 @@ if __name__ == "__main__":
             atari_params, np.array([envs.single_observation_space.sample()])
         ),
     )
+    actor_params = actor.init(
+        actor_key,
+        body.apply(
+            body_params,
+            atari_encoder.apply(
+                atari_params,
+                np.array([envs.single_observation_space.sample()]),
+            ),
+        ),
+    )
+    critic_params = critic.init(
+        critic_key,
+        body.apply(
+            body_params,
+            atari_encoder.apply(
+                atari_params,
+                np.array([envs.single_observation_space.sample()]),
+            ),
+        ),
+    )
     slow_opt = optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=partial(linear_schedule, use_proxy=False)
-                if args.anneal_lr
-                else args.transfer_learning_rate,
-                eps=1e-5,
-            )
+        optax.clip_by_global_norm(args.max_grad_norm),
+        optax.inject_hyperparams(optax.adam)(
+            learning_rate=partial(linear_schedule, use_proxy=False)
+            if args.anneal_lr
+            else args.transfer_learning_rate,
+            eps=1e-5,
+        ),
     )
     if args.freeze_first_layer_on_transfer:
-        slow_opt = optax.multi_transform({"encoder": slow_opt, "rest": optax.set_to_zero()},
-        params=AgentParams(atari_params={k:"encoder" for k in atari_params.keys()}, minatar_params={k:"encoder" for k in minatar_params.keys()},
-        body_params={k:"rest" for k in body_params.keys()}, actor_params={k:"rest" for k in actor_params.keys()}, critic_params={k:"rest" for k in critic_params.keys()}))
+        slow_opt = optax.multi_transform(
+            {"encoder": slow_opt, "rest": optax.set_to_zero()},
+            param_labels=AgentParams(
+                atari_params=core.frozen_dict.freeze(
+                    {k: "encoder" for k in atari_params.keys()}
+                ),
+                minatar_params=core.frozen_dict.freeze(
+                    {k: "encoder" for k in minatar_params.keys()}
+                ),
+                body_params=core.frozen_dict.freeze(
+                    {k: "rest" for k in body_params.keys()}
+                ),
+                actor_params=core.frozen_dict.freeze(
+                    {k: "rest" for k in actor_params.keys()}
+                ),
+                critic_params=core.frozen_dict.freeze(
+                    {k: "rest" for k in critic_params.keys()}
+                ),
+            ),
+        )
     agent_state = DualOptimizerTrainState.create(
         apply_fn=None,
         params=AgentParams(
-            atari_params,
-            minatar_params,
-            body_params,
-            actor.init(
-                actor_key,
-                body.apply(
-                    body_params,
-                    atari_encoder.apply(
-                        atari_params,
-                        np.array([envs.single_observation_space.sample()]),
-                    ),
-                ),
-            ),
-            critic.init(
-                critic_key,
-                body.apply(
-                    body_params,
-                    atari_encoder.apply(
-                        atari_params,
-                        np.array([envs.single_observation_space.sample()]),
-                    ),
-                ),
-            ),
+            atari_params, minatar_params, body_params, actor_params, critic_params
         ),
-        slow_opt=optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=partial(linear_schedule, use_proxy=False)
-                if args.anneal_lr
-                else args.transfer_learning_rate,
-                eps=1e-5,
-            ),
-        ),
+        slow_tx=slow_opt,
         fast_tx=optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
@@ -946,18 +957,38 @@ if __name__ == "__main__":
             raise ValueError("Incorrect stop selection strategy")
 
     update = 0
+
     def freeze_encoder(agent_state):
         assert args.transfer_environment == "minatar"
         new_minatar_params = minatar_encoder.init(
             minatar_key,
             np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
         )
-        
+        reinitialised_params = AgentParams(
+            atari_params=agent_state.params.atari_params,
+            minatar_params=new_minatar_params,
+            body_params=agent_state.params.body_params,
+            actor_params=agent_state.params.actor_params,
+            critic_params=agent_state.params.critic_params,
+        )
+        return DualOptimizerTrainState.create(
+            apply_fn=None,
+            params=reinitialised_params,
+            slow_tx=agent_state.slow_tx,
+            fast_tx=agent_state.fast_tx,
+        )
+
     while stop_condition():
         update_time_start = time.time()
         key, rollout_key = jax.random.split(key)
         do_rollout_minatar = should_rollout_minatar(rollout_key)
         if not do_rollout_minatar:
+            if (
+                args.freeze_first_layer_on_transfer
+                and args.rollout_strategy == "minatar_first"
+                and transfer_step == 0
+            ):
+                agent_state = freeze_encoder(agent_state)
             (
                 agent_state,
                 transfer_episode_stats,
