@@ -112,6 +112,12 @@ def parse_args():
     # fmt: on
     return args
 
+def map_nested_fn(fn):
+  '''Recursively apply `fn` to the key-value pairs of a nested dict'''
+  def map_fn(nested_dict):
+    return {k: (map_fn(v) if isinstance(v, dict) else fn(k, v))
+            for k, v in nested_dict.items()}
+  return map_fn
 
 class GymnaxWrapper(object):
     """Base class for Gymnax wrappers."""
@@ -330,16 +336,10 @@ class DualOptimizerTrainState(struct.PyTreeNode):
         opt_state = self.fast_opt_state if use_fast_tx else self.slow_opt_state
         updates, new_opt_state = tx.update(grads, opt_state, self.params)
         new_params = optax.apply_updates(self.params, updates)
-        new_slow_opt_state = jax.tree_map(
-            lambda x, y: jax.lax.select(use_fast_tx, x, y),
-            self.slow_opt_state,
-            new_opt_state,
-        )
-        new_fast_opt_state = jax.tree_map(
-            lambda x, y: jax.lax.select(use_fast_tx, x, y),
-            new_opt_state,
-            self.fast_opt_state,
-        )
+        
+        new_slow_opt_state = self.slow_opt_state if use_fast_tx else new_opt_state
+        new_fast_opt_state = new_opt_state if use_fast_tx else self.fast_opt_state
+        
 
         return self.replace(
             step=self.step + 1,
@@ -541,7 +541,7 @@ if __name__ == "__main__":
     action_dim = (
         envs.single_action_space.n
         if args.transfer_environment == "atari"
-        else minatar_envs.action_space.n
+        else minatar_envs.action_space(env_params).n
     )
     actor = Actor(action_dim=action_dim)
     critic = Critic()
@@ -595,19 +595,19 @@ if __name__ == "__main__":
             {"encoder": slow_opt, "rest": optax.set_to_zero()},
             param_labels=AgentParams(
                 atari_params=core.frozen_dict.freeze(
-                    {k: "encoder" for k in atari_params.keys()}
+                    map_nested_fn(lambda k, _: "encoder")(atari_params)
                 ),
                 minatar_params=core.frozen_dict.freeze(
-                    {k: "encoder" for k in minatar_params.keys()}
+                    map_nested_fn(lambda k, _: "encoder")(minatar_params)
                 ),
                 body_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in body_params.keys()}
+                    map_nested_fn(lambda k, _: "rest")(body_params)
                 ),
                 actor_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in actor_params.keys()}
+                    map_nested_fn(lambda k, _: "rest")(actor_params)
                 ),
                 critic_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in critic_params.keys()}
+                    map_nested_fn(lambda k, _: "rest")(critic_params)
                 ),
             ),
         )
@@ -983,12 +983,12 @@ if __name__ == "__main__":
         key, rollout_key = jax.random.split(key)
         do_rollout_minatar = should_rollout_minatar(rollout_key)
         if not do_rollout_minatar:
-            if (
-                args.freeze_first_layer_on_transfer
-                and args.rollout_strategy == "minatar_first"
-                and transfer_step == 0
-            ):
-                agent_state = freeze_encoder(agent_state)
+            # if (
+            #    args.freeze_first_layer_on_transfer
+            #     and args.rollout_selection_strategy == "minatar_first"
+            #    and transfer_step == 0
+            #):
+            #    agent_state = freeze_encoder(agent_state)
             (
                 agent_state,
                 transfer_episode_stats,
@@ -1077,6 +1077,7 @@ if __name__ == "__main__":
             np.mean(jax.device_get(episode_stats.returned_episode_lengths)),
             global_step,
         )
+        import pdb; pdb.set_trace()
         writer.add_scalar(
             f"charts/{prefix}_learning_rate",
             getattr(
