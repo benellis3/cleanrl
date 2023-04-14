@@ -63,7 +63,7 @@ def parse_args():
     parser.add_argument("--total-transfer-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
     parser.add_argument("--total-minatar-steps", type=int, default=100000000)
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--learning-rate", type=float, default=1e-3,
         help="the learning rate of the optimizer for atari")
     parser.add_argument("--transfer-num-envs", type=int, default=8,
         help="the number of parallel game environments")
@@ -93,6 +93,10 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
+    parser.add_argument("--minatar-only", type=lambda x: bool(strtobool(x)), default=False,
+        help="Only train on minatar")
+    parser.add_argument("--transfer-only", type=lambda x: bool(strtobool(x)), default=False,
+        help="Only train on the transfer environment")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -337,7 +341,7 @@ class EpisodeStatistics:
 
 
 class UpdateStats(NamedTuple):
-    update_time_start: ...
+    update_time_start: float
     v_loss: jnp.array
     pg_loss: jnp.array
     entropy_loss: jnp.array
@@ -347,7 +351,7 @@ class UpdateStats(NamedTuple):
 
 def log_stats(writer, episode_stats, env_step, global_step, prefix, update_stats):
     update_time_start, v_loss, pg_loss, entropy_loss, approx_kl, loss = update_stats
-    num_envs = getattr(args, f"num_{prefix}_envs")
+    num_envs = getattr(args, f"{prefix}_num_envs")
     avg_episodic_return = np.mean(
         jax.device_get(episode_stats.returned_episode_returns)
     )
@@ -504,10 +508,7 @@ if __name__ == "__main__":
         frac = (
             1.0 - (count // (args.num_minibatches * args.update_epochs)) / num_updates
         )
-        learning_rate = (
-            args.transfer_learning_rate if not use_proxy else args.minatar_learning_rate
-        )
-        return learning_rate * frac
+        return args.learning_rate * frac
 
     def make_opt(use_proxy):
         return optax.chain(
@@ -526,7 +527,7 @@ if __name__ == "__main__":
     action_dim = (
         envs.single_action_space.n
         if args.transfer_environment == "atari"
-        else minatar_envs.action_space.n
+        else minatar_envs.action_space(env_params).n
     )
     actor = Actor(action_dim=action_dim)
     critic = Critic()
@@ -705,7 +706,7 @@ if __name__ == "__main__":
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-    @partial(jax.jit, static_argnames=["use_minatar", "use_proxy"])
+    @partial(jax.jit, static_argnames=["use_minatar"])
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
@@ -877,114 +878,116 @@ if __name__ == "__main__":
         ),
         max_steps=args.num_steps,
     )
+    if not args.transfer_only:
+        for update in range(1, args.num_minatar_updates + 1):
+            update_time_start = time.time()
+            (
+                agent_state,
+                minatar_episode_stats,
+                minatar_next_obs,
+                minatar_next_done,
+                minatar_storage,
+                key,
+                env_state,
+            ) = rollout_minatar(
+                agent_state,
+                minatar_episode_stats,
+                minatar_next_obs,
+                minatar_next_done,
+                key,
+                env_state,
+            )
+            storage, next_obs, next_done = (
+                minatar_storage,
+                minatar_next_obs,
+                minatar_next_done,
+            )
 
-    for update in range(1, args.num_minatar_updates + 1):
-        update_time_start = time.time()
-        (
-            agent_state,
-            minatar_episode_stats,
-            minatar_next_obs,
-            minatar_next_done,
-            minatar_storage,
-            key,
-            env_state,
-        ) = rollout_minatar(
-            agent_state,
-            minatar_episode_stats,
-            minatar_next_obs,
-            minatar_next_done,
-            key,
-            env_state,
-        )
-        storage, next_obs, next_done = (
-            minatar_storage,
-            minatar_next_obs,
-            minatar_next_done,
-        )
-
-        global_step += args.num_steps * args.minatar_num_envs
-        minatar_step += args.num_steps * args.minatar_num_envs
-        storage = compute_gae(
-            agent_state, next_obs, next_done, storage, use_minatar=True, use_proxy=True
-        )
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-            agent_state, storage, key, True
-        )
-        log_stats(
-            writer=writer,
-            episode_stats=minatar_episode_stats,
-            env_step=minatar_step,
-            global_step=global_step,
-            prefix="minatar",
-            update_stats=UpdateStats(
-                update_time_start=update_time_start,
-                v_loss=v_loss,
-                pg_loss=pg_loss,
-                entropy_loss=entropy_loss,
-                approx_kl=approx_kl,
-                loss=loss,
-            ),
-        )
+            global_step += args.num_steps * args.minatar_num_envs
+            minatar_step += args.num_steps * args.minatar_num_envs
+            storage = compute_gae(
+                agent_state, next_obs, next_done, storage, use_minatar=True, use_proxy=True
+            )
+            agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+                agent_state, storage, key, True
+            )
+            log_stats(
+                writer=writer,
+                episode_stats=minatar_episode_stats,
+                env_step=minatar_step,
+                global_step=global_step,
+                prefix="minatar",
+                update_stats=UpdateStats(
+                    update_time_start=update_time_start,
+                    v_loss=v_loss,
+                    pg_loss=pg_loss,
+                    entropy_loss=entropy_loss,
+                    approx_kl=approx_kl,
+                    loss=loss,
+                ),
+            )
 
     # roll out on the transfer environment
     # make sure to reinitialise the training state so that the
     # optimiser state gets reset
-    agent_state = TrainState.create(
-        apply_fn=None, params=agent_state.params, tx=make_opt(use_proxy=False)
-    )
-    for update in range(1, args.num_transfer_updates + 1):
-        update_time_start = time.time()
-        (
-            agent_state,
-            transfer_episode_stats,
-            transfer_next_obs,
-            transfer_next_done,
-            transfer_storage,
-            key,
-            transfer_handle,
-        ) = rollout_transfer(
-            agent_state,
-            transfer_episode_stats,
-            transfer_next_obs,
-            transfer_next_done,
-            key,
-            transfer_handle,
+    
+    if not args.minatar_only:
+        agent_state = TrainState.create(
+            apply_fn=None, params=agent_state.params, tx=make_opt(use_proxy=False)
         )
-        storage, next_obs, next_done = (
-            transfer_storage,
-            transfer_next_obs,
-            transfer_next_done,
-        )
+        for update in range(1, args.num_transfer_updates + 1):
+            update_time_start = time.time()
+            (
+                agent_state,
+                transfer_episode_stats,
+                transfer_next_obs,
+                transfer_next_done,
+                transfer_storage,
+                key,
+                transfer_handle,
+            ) = rollout_transfer(
+                agent_state,
+                transfer_episode_stats,
+                transfer_next_obs,
+                transfer_next_done,
+                key,
+                transfer_handle,
+            )
+            storage, next_obs, next_done = (
+                transfer_storage,
+                transfer_next_obs,
+                transfer_next_done,
+            )
 
-        global_step += args.num_steps * args.transfer_num_envs
-        minatar_step += args.num_steps * args.transfer_num_envs
-        use_minatar = args.transfer_environment == "minatar"
-        storage = compute_gae(
-            agent_state,
-            next_obs,
-            next_done,
-            storage,
-            use_minatar=use_minatar,
-            use_proxy=False,
-        )
-        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-            agent_state, storage, key, True
-        )
-        log_stats(
-            writer=writer,
-            episode_stats=minatar_episode_stats,
-            env_step=minatar_step,
-            global_step=global_step,
-            prefix="transfer",
-            update_stats=UpdateStats(
-                update_time_start=update_time_start,
-                v_loss=v_loss,
-                pg_loss=pg_loss,
-                entropy_loss=entropy_loss,
-                approx_kl=approx_kl,
-                loss=loss,
-            ),
-        )
+            global_step += args.num_steps * args.transfer_num_envs
+            transfer_step += args.num_steps * args.transfer_num_envs
+            use_minatar = args.transfer_environment == "minatar"
+            storage = compute_gae(
+                agent_state,
+                next_obs,
+                next_done,
+                storage,
+                use_minatar=use_minatar,
+                use_proxy=False,
+            )
+            agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+                agent_state, storage, key, use_minatar
+            )
+            log_stats(
+                writer=writer,
+                episode_stats=transfer_episode_stats,
+                env_step=minatar_step,
+                global_step=global_step,
+                prefix="transfer",
+                update_stats=UpdateStats(
+                    update_time_start=update_time_start,
+                    v_loss=v_loss,
+                    pg_loss=pg_loss,
+                    entropy_loss=entropy_loss,
+                    approx_kl=approx_kl,
+                    loss=loss,
+                ),
+            )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
