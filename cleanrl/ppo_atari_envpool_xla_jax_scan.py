@@ -5,7 +5,7 @@ import random
 import time
 from distutils.util import strtobool
 from functools import partial
-from typing import Sequence, Any, Callable
+from typing import Sequence, Any, Callable, NamedTuple
 
 
 os.environ[
@@ -63,19 +63,12 @@ def parse_args():
     parser.add_argument("--total-transfer-timesteps", type=int, default=10000000,
         help="total timesteps of the experiments")
     parser.add_argument("--total-minatar-steps", type=int, default=100000000)
-    parser.add_argument("--transfer-learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
         help="the learning rate of the optimizer for atari")
-    parser.add_argument("--minatar-learning-rate", type=float, default=2.5e-4,
-        help="The learning rate for minatar")
     parser.add_argument("--transfer-num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--minatar-num-envs", type=int, default=128, 
         help="the number of parallel minatar environments to run")
-    parser.add_argument("--rollout-selection-strategy", type=str, default="minatar",
-        help="How to select when to switch between MinAtar and Atari")
-    parser.add_argument("--rollout-selection-prob", type=float, default=0.8,
-        help="The probability to select MinAtar or Atari. Only effective if the selection strategy is `random`")
-    parser.add_argument("--stop-selection-strategy", type=str, default="num_updates")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
@@ -100,7 +93,6 @@ def parse_args():
         help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None,
         help="the target KL divergence threshold")
-    parser.add_argument("--freeze-first-layer-on-transfer", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True, help="Determines whether to freeze the encoder when transferring to a new environment")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -315,57 +307,6 @@ class Actor(nn.Module):
         )(x)
 
 
-class DualOptimizerTrainState(struct.PyTreeNode):
-    step: int
-    apply_fn: Callable = struct.field(pytree_node=False)
-    params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
-    slow_tx: optax.GradientTransformation = struct.field(pytree_node=False)
-    slow_opt_state: optax.OptState = struct.field(pytree_node=True)
-    fast_tx: optax.GradientTransformation = struct.field(pytree_node=False)
-    fast_opt_state: optax.OptState = struct.field(pytree_node=True)
-
-    @partial(jax.jit, static_argnames=["use_fast_tx"])
-    def apply_gradients(self, *, grads, use_fast_tx, **kwargs):
-        tx = self.fast_tx if use_fast_tx else self.slow_tx
-        opt_state = self.fast_opt_state if use_fast_tx else self.slow_opt_state
-        updates, new_opt_state = tx.update(grads, opt_state, self.params)
-        new_params = optax.apply_updates(self.params, updates)
-        new_slow_opt_state = jax.tree_map(
-            lambda x, y: jax.lax.select(use_fast_tx, x, y),
-            self.slow_opt_state,
-            new_opt_state,
-        )
-        new_fast_opt_state = jax.tree_map(
-            lambda x, y: jax.lax.select(use_fast_tx, x, y),
-            new_opt_state,
-            self.fast_opt_state,
-        )
-
-        return self.replace(
-            step=self.step + 1,
-            params=new_params,
-            slow_opt_state=new_slow_opt_state,
-            fast_opt_state=new_fast_opt_state,
-            **kwargs,
-        )
-
-    @classmethod
-    def create(cls, *, apply_fn, params, slow_tx, fast_tx, **kwargs):
-        """Creates a new instance with `step=0` and initialized `opt_state`."""
-        slow_opt_state = slow_tx.init(params)
-        fast_opt_state = fast_tx.init(params)
-        return cls(
-            step=0,
-            apply_fn=apply_fn,
-            params=params,
-            slow_tx=slow_tx,
-            slow_opt_state=slow_opt_state,
-            fast_tx=fast_tx,
-            fast_opt_state=fast_opt_state,
-            **kwargs,
-        )
-
-
 @flax.struct.dataclass
 class AgentParams:
     atari_params: flax.core.FrozenDict
@@ -393,6 +334,55 @@ class EpisodeStatistics:
     episode_lengths: jnp.array
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
+
+
+class UpdateStats(NamedTuple):
+    update_time_start: ...
+    v_loss: jnp.array
+    pg_loss: jnp.array
+    entropy_loss: jnp.array
+    approx_kl: jnp.array
+    loss: jnp.array
+
+
+def log_stats(writer, episode_stats, env_step, global_step, prefix, update_stats):
+    update_time_start, v_loss, pg_loss, entropy_loss, approx_kl, loss = update_stats
+    num_envs = getattr(args, f"num_{prefix}_envs")
+    avg_episodic_return = np.mean(
+        jax.device_get(episode_stats.returned_episode_returns)
+    )
+    print(
+        f"global_step={global_step}, {prefix}_avg_episodic_return={avg_episodic_return}"
+    )
+
+    writer.add_scalar(
+        f"charts/{prefix}_avg_episodic_return", avg_episodic_return, global_step
+    )
+    writer.add_scalar(f"{prefix}_step", env_step, global_step)
+    writer.add_scalar(
+        f"charts/{prefix}_avg_episodic_length",
+        np.mean(jax.device_get(episode_stats.returned_episode_lengths)),
+        global_step,
+    )
+    writer.add_scalar(
+        f"charts/{prefix}_learning_rate",
+        getattr(agent_state, "opt_state")[1].hyperparams["learning_rate"].item(),
+        global_step,
+    )
+    writer.add_scalar("losses/value_loss", v_loss[-1, -1].item(), global_step)
+    writer.add_scalar("losses/policy_loss", pg_loss[-1, -1].item(), global_step)
+    writer.add_scalar("losses/entropy", entropy_loss[-1, -1].item(), global_step)
+    writer.add_scalar("losses/approx_kl", approx_kl[-1, -1].item(), global_step)
+    writer.add_scalar("losses/loss", loss[-1, -1].item(), global_step)
+    print("SPS:", int(global_step / (time.time() - start_time)))
+    writer.add_scalar(
+        "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+    )
+    writer.add_scalar(
+        "charts/SPS_update",
+        int(num_envs * args.num_steps / (time.time() - update_time_start)),
+        global_step,
+    )
 
 
 if __name__ == "__main__":
@@ -508,32 +498,27 @@ if __name__ == "__main__":
     def linear_schedule(count, use_proxy):
         # anneal learning rate linearly after one training iteration which contains
         # (args.num_minibatches * args.update_epochs) gradient updates
-        if args.stop_selection_strategy == "num_updates":
-            frac = (
-                1.0
-                - (count // (args.num_minibatches * args.update_epochs))
-                / args.num_updates
-            )
-        elif args.stop_selection_strategy == "num_transfer_steps":
-            if args.rollout_selection_strategy == "minatar_first":
-                if use_proxy:
-                    frac = 1.0 - (
-                        count
-                        // (args.num_minibatches * args.update_epochs)
-                        / args.num_minatar_updates
-                    )
-                else:
-                    frac = 1.0 - (
-                        count
-                        // (args.num_minibatches * args.update_epochs)
-                        / args.num_transfer_updates
-                    )
-            else:
-                frac = 1.0 - transfer_step / args.total_timesteps
+        num_updates = (
+            args.num_transfer_updates if not use_proxy else args.num_minatar_updates
+        )
+        frac = (
+            1.0 - (count // (args.num_minibatches * args.update_epochs)) / num_updates
+        )
         learning_rate = (
             args.transfer_learning_rate if not use_proxy else args.minatar_learning_rate
         )
         return learning_rate * frac
+
+    def make_opt(use_proxy):
+        return optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.inject_hyperparams(optax.adam)(
+                learning_rate=partial(linear_schedule, use_proxy=use_proxy)
+                if args.anneal_lr
+                else args.learning_rate,
+                eps=1e-5,
+            ),
+        )
 
     atari_encoder = AtariEncoder()
     minatar_encoder = MinAtarEncoder()
@@ -549,7 +534,6 @@ if __name__ == "__main__":
     atari_params = atari_encoder.init(
         atari_key, np.array([envs.single_observation_space.sample()])
     )
-    # TODO add observation space to wrappers
     minatar_params = minatar_encoder.init(
         minatar_key,
         np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
@@ -581,51 +565,13 @@ if __name__ == "__main__":
             ),
         ),
     )
-    slow_opt = optax.chain(
-        optax.clip_by_global_norm(args.max_grad_norm),
-        optax.inject_hyperparams(optax.adam)(
-            learning_rate=partial(linear_schedule, use_proxy=False)
-            if args.anneal_lr
-            else args.transfer_learning_rate,
-            eps=1e-5,
-        ),
-    )
-    if args.freeze_first_layer_on_transfer:
-        slow_opt = optax.multi_transform(
-            {"encoder": slow_opt, "rest": optax.set_to_zero()},
-            param_labels=AgentParams(
-                atari_params=core.frozen_dict.freeze(
-                    {k: "encoder" for k in atari_params.keys()}
-                ),
-                minatar_params=core.frozen_dict.freeze(
-                    {k: "encoder" for k in minatar_params.keys()}
-                ),
-                body_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in body_params.keys()}
-                ),
-                actor_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in actor_params.keys()}
-                ),
-                critic_params=core.frozen_dict.freeze(
-                    {k: "rest" for k in critic_params.keys()}
-                ),
-            ),
-        )
-    agent_state = DualOptimizerTrainState.create(
+
+    agent_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
             atari_params, minatar_params, body_params, actor_params, critic_params
         ),
-        slow_tx=slow_opt,
-        fast_tx=optax.chain(
-            optax.clip_by_global_norm(args.max_grad_norm),
-            optax.inject_hyperparams(optax.adam)(
-                learning_rate=partial(linear_schedule, use_proxy=True)
-                if args.anneal_lr
-                else args.minatar_learning_rate,
-                eps=1e-5,
-            ),
-        ),
+        tx=make_opt(use_proxy=True),
     )
     atari_encoder.apply = jax.jit(atari_encoder.apply)
     minatar_encoder.apply = jax.jit(minatar_encoder.apply)
@@ -765,7 +711,6 @@ if __name__ == "__main__":
         storage: Storage,
         key: jax.random.PRNGKey,
         use_minatar: bool,
-        use_proxy: bool,
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -796,9 +741,7 @@ if __name__ == "__main__":
                     minibatch.returns,
                     use_minatar,
                 )
-                agent_state = agent_state.apply_gradients(
-                    grads=grads, use_fast_tx=use_proxy
-                )
+                agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (
                     loss,
                     pg_loss,
@@ -935,170 +878,112 @@ if __name__ == "__main__":
         max_steps=args.num_steps,
     )
 
-    def should_rollout_minatar(key):
-        if args.rollout_selection_strategy == "minatar":
-            return True
-        elif args.rollout_selection_strategy == "atari":
-            return False
-        elif args.rollout_selection_strategy == "random":
-            sample = jax.random.uniform(key)
-            return bool(sample < args.rollout_selection_prob)
-        elif args.rollout_selection_strategy == "minatar_first":
-            return global_step < args.total_minatar_steps
-        else:
-            raise ValueError("Incorrect rollout selection strategy")
-
-    def stop_condition():
-        if args.stop_selection_strategy == "num_updates":
-            return update < args.num_updates + 1
-        elif args.stop_selection_strategy == "num_transfer_steps":
-            return transfer_step < args.total_transfer_timesteps + 1
-        else:
-            raise ValueError("Incorrect stop selection strategy")
-
-    update = 0
-
-    def freeze_encoder(agent_state):
-        assert args.transfer_environment == "minatar"
-        new_minatar_params = minatar_encoder.init(
-            minatar_key,
-            np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
-        )
-        reinitialised_params = AgentParams(
-            atari_params=agent_state.params.atari_params,
-            minatar_params=new_minatar_params,
-            body_params=agent_state.params.body_params,
-            actor_params=agent_state.params.actor_params,
-            critic_params=agent_state.params.critic_params,
-        )
-        return DualOptimizerTrainState.create(
-            apply_fn=None,
-            params=reinitialised_params,
-            slow_tx=agent_state.slow_tx,
-            fast_tx=agent_state.fast_tx,
-        )
-
-    while stop_condition():
+    for update in range(1, args.num_minatar_updates + 1):
         update_time_start = time.time()
-        key, rollout_key = jax.random.split(key)
-        do_rollout_minatar = should_rollout_minatar(rollout_key)
-        if not do_rollout_minatar:
-            if (
-                args.freeze_first_layer_on_transfer
-                and args.rollout_strategy == "minatar_first"
-                and transfer_step == 0
-            ):
-                agent_state = freeze_encoder(agent_state)
-            (
-                agent_state,
-                transfer_episode_stats,
-                transfer_next_obs,
-                transfer_next_done,
-                transfer_storage,
-                key,
-                transfer_handle,
-            ) = rollout_transfer(
-                agent_state,
-                transfer_episode_stats,
-                transfer_next_obs,
-                transfer_next_done,
-                key,
-                transfer_handle,
-            )
-            storage, next_obs, next_done = (
-                transfer_storage,
-                transfer_next_obs,
-                transfer_next_done,
-            )
-            num_envs = args.transfer_num_envs
-            prefix = "transfer"
-        else:
-            (
-                agent_state,
-                minatar_episode_stats,
-                minatar_next_obs,
-                minatar_next_done,
-                minatar_storage,
-                key,
-                env_state,
-            ) = rollout_minatar(
-                agent_state,
-                minatar_episode_stats,
-                minatar_next_obs,
-                minatar_next_done,
-                key,
-                env_state,
-            )
-            storage, next_obs, next_done = (
-                minatar_storage,
-                minatar_next_obs,
-                minatar_next_done,
-            )
-            num_envs = args.minatar_num_envs
-            prefix = "minatar"
+        (
+            agent_state,
+            minatar_episode_stats,
+            minatar_next_obs,
+            minatar_next_done,
+            minatar_storage,
+            key,
+            env_state,
+        ) = rollout_minatar(
+            agent_state,
+            minatar_episode_stats,
+            minatar_next_obs,
+            minatar_next_done,
+            key,
+            env_state,
+        )
+        storage, next_obs, next_done = (
+            minatar_storage,
+            minatar_next_obs,
+            minatar_next_done,
+        )
 
-        global_step += args.num_steps * num_envs
-        if prefix == "minatar":
-            minatar_step += args.num_steps * num_envs
-        elif prefix == "transfer":
-            transfer_step += args.num_steps * num_envs
-        use_minatar = args.transfer_environment == "minatar" or do_rollout_minatar
+        global_step += args.num_steps * args.minatar_num_envs
+        minatar_step += args.num_steps * args.minatar_num_envs
+        storage = compute_gae(
+            agent_state, next_obs, next_done, storage, use_minatar=True, use_proxy=True
+        )
+        agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
+            agent_state, storage, key, True
+        )
+        log_stats(
+            writer=writer,
+            episode_stats=minatar_episode_stats,
+            env_step=minatar_step,
+            global_step=global_step,
+            prefix="minatar",
+            update_stats=UpdateStats(
+                update_time_start=update_time_start,
+                v_loss=v_loss,
+                pg_loss=pg_loss,
+                entropy_loss=entropy_loss,
+                approx_kl=approx_kl,
+                loss=loss,
+            ),
+        )
+
+    # roll out on the transfer environment
+    # make sure to reinitialise the training state so that the
+    # optimiser state gets reset
+    agent_state = TrainState.create(
+        apply_fn=None, params=agent_state.params, tx=make_opt(use_proxy=False)
+    )
+    for update in range(1, args.num_transfer_updates + 1):
+        update_time_start = time.time()
+        (
+            agent_state,
+            transfer_episode_stats,
+            transfer_next_obs,
+            transfer_next_done,
+            transfer_storage,
+            key,
+            transfer_handle,
+        ) = rollout_transfer(
+            agent_state,
+            transfer_episode_stats,
+            transfer_next_obs,
+            transfer_next_done,
+            key,
+            transfer_handle,
+        )
+        storage, next_obs, next_done = (
+            transfer_storage,
+            transfer_next_obs,
+            transfer_next_done,
+        )
+
+        global_step += args.num_steps * args.transfer_num_envs
+        minatar_step += args.num_steps * args.transfer_num_envs
+        use_minatar = args.transfer_environment == "minatar"
         storage = compute_gae(
             agent_state,
             next_obs,
             next_done,
             storage,
-            use_proxy=do_rollout_minatar,
             use_minatar=use_minatar,
+            use_proxy=False,
         )
-        use_minatar_ppo = prefix == "minatar" or args.transfer_environment == "minatar"
         agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-            agent_state, storage, key, use_minatar_ppo, use_proxy=prefix == "minatar"
+            agent_state, storage, key, True
         )
-        update += 1
-        episode_stats = (
-            minatar_episode_stats if prefix == "minatar" else transfer_episode_stats
-        )
-        avg_episodic_return = np.mean(
-            jax.device_get(episode_stats.returned_episode_returns)
-        )
-        print(
-            f"global_step={global_step}, {prefix}_avg_episodic_return={avg_episodic_return}"
-        )
-
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar(
-            f"charts/{prefix}_avg_episodic_return", avg_episodic_return, global_step
-        )
-        writer.add_scalar("transfer_step", transfer_step, global_step)
-        writer.add_scalar("minatar_step", minatar_step, global_step)
-        writer.add_scalar(
-            f"charts/{prefix}_avg_episodic_length",
-            np.mean(jax.device_get(episode_stats.returned_episode_lengths)),
-            global_step,
-        )
-        writer.add_scalar(
-            f"charts/{prefix}_learning_rate",
-            getattr(
-                agent_state, f"{'slow' if prefix == 'transfer' else 'fast'}_opt_state"
-            )[1]
-            .hyperparams["learning_rate"]
-            .item(),
-            global_step,
-        )
-        writer.add_scalar("losses/value_loss", v_loss[-1, -1].item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss[-1, -1].item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss[-1, -1].item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl[-1, -1].item(), global_step)
-        writer.add_scalar("losses/loss", loss[-1, -1].item(), global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar(
-            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
-        )
-        writer.add_scalar(
-            "charts/SPS_update",
-            int(num_envs * args.num_steps / (time.time() - update_time_start)),
-            global_step,
+        log_stats(
+            writer=writer,
+            episode_stats=minatar_episode_stats,
+            env_step=minatar_step,
+            global_step=global_step,
+            prefix="transfer",
+            update_stats=UpdateStats(
+                update_time_start=update_time_start,
+                v_loss=v_loss,
+                pg_loss=pg_loss,
+                entropy_loss=entropy_loss,
+                approx_kl=approx_kl,
+                loss=loss,
+            ),
         )
 
     if args.save_model:
