@@ -910,11 +910,22 @@ if __name__ == "__main__":
             global_step += args.num_steps * args.minatar_num_envs
             minatar_step += args.num_steps * args.minatar_num_envs
             storage = compute_gae(
-                agent_state, next_obs, next_done, storage, use_minatar=True, use_proxy=True
+                agent_state,
+                next_obs,
+                next_done,
+                storage,
+                use_minatar=True,
+                use_proxy=True,
             )
-            agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-                agent_state, storage, key, True
-            )
+            (
+                agent_state,
+                loss,
+                pg_loss,
+                v_loss,
+                entropy_loss,
+                approx_kl,
+                key,
+            ) = update_ppo(agent_state, storage, key, True)
             log_stats(
                 writer=writer,
                 episode_stats=minatar_episode_stats,
@@ -934,16 +945,17 @@ if __name__ == "__main__":
     # roll out on the transfer environment
     # make sure to reinitialise the training state so that the
     # optimiser state gets reset
-    
+
     if not args.minatar_only:
         if args.freeze_final_layers_on_transfer:
-            opt = optax.multi_transform({"encoder": make_opt(use_proxy=False), "rest": optax.set_to_zero()},
+            opt = optax.multi_transform(
+                {"encoder": make_opt(use_proxy=False), "rest": optax.set_to_zero()},
                 param_labels=AgentParams(
                     atari_params="encoder",
                     minatar_params="encoder",
                     body_params="rest",
                     actor_params="rest",
-                    critic_params="rest"
+                    critic_params="rest",
                 ),
             )
         else:
@@ -965,9 +977,7 @@ if __name__ == "__main__":
             )
         else:
             params = agent_state.params
-        agent_state = TrainState.create(
-            apply_fn=None, params=params, tx=make_opt(use_proxy=False)
-        )
+        agent_state = TrainState.create(apply_fn=None, params=params, tx=opt)
         for update in range(1, args.num_transfer_updates + 1):
             update_time_start = time.time()
             (
@@ -1003,9 +1013,15 @@ if __name__ == "__main__":
                 use_minatar=use_minatar,
                 use_proxy=False,
             )
-            agent_state, loss, pg_loss, v_loss, entropy_loss, approx_kl, key = update_ppo(
-                agent_state, storage, key, use_minatar
-            )
+            (
+                agent_state,
+                loss,
+                pg_loss,
+                v_loss,
+                entropy_loss,
+                approx_kl,
+                key,
+            ) = update_ppo(agent_state, storage, key, use_minatar)
             log_stats(
                 writer=writer,
                 episode_stats=transfer_episode_stats,
