@@ -97,6 +97,10 @@ def parse_args():
         help="Only train on minatar")
     parser.add_argument("--transfer-only", type=lambda x: bool(strtobool(x)), default=False,
         help="Only train on the transfer environment")
+    parser.add_argument("--freeze-final-layers-on-transfer", type=lambda x: bool(strtobool(x)), default=False,
+        help="Whether to freeze the final layers when transferring from one environment to another")
+    parser.add_argument("--reinitialise-encoder", type=lambda x: bool(strtobool(x)), default=False,
+        help="Whether to reinitialise the encoder")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -932,8 +936,37 @@ if __name__ == "__main__":
     # optimiser state gets reset
     
     if not args.minatar_only:
+        if args.freeze_final_layers_on_transfer:
+            opt = optax.multi_transform({"encoder": make_opt(use_proxy=False), "rest": optax.set_to_zero()},
+                param_labels=AgentParams(
+                    atari_params="encoder",
+                    minatar_params="encoder",
+                    body_params="rest",
+                    actor_params="rest",
+                    critic_params="rest"
+                ),
+            )
+        else:
+            opt = make_opt(use_proxy=False)
+        if args.reinitialise_encoder:
+            atari_params = atari_encoder.init(
+                atari_key, np.array([envs.single_observation_space.sample()])
+            )
+            minatar_params = minatar_encoder.init(
+                minatar_key,
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
+            )
+            params = AgentParams(
+                atari_params=atari_params,
+                minatar_params=minatar_params,
+                body_params=agent_state.params.body_params,
+                actor_params=agent_state.params.actor_params,
+                critic_params=agent_state.params.critic_params,
+            )
+        else:
+            params = agent_state.params
         agent_state = TrainState.create(
-            apply_fn=None, params=agent_state.params, tx=make_opt(use_proxy=False)
+            apply_fn=None, params=params, tx=make_opt(use_proxy=False)
         )
         for update in range(1, args.num_transfer_updates + 1):
             update_time_start = time.time()
@@ -976,7 +1009,7 @@ if __name__ == "__main__":
             log_stats(
                 writer=writer,
                 episode_stats=transfer_episode_stats,
-                env_step=minatar_step,
+                env_step=transfer_step,
                 global_step=global_step,
                 prefix="transfer",
                 update_stats=UpdateStats(
