@@ -372,11 +372,12 @@ def log_stats(writer, episode_stats, env_step, global_step, prefix, update_stats
         np.mean(jax.device_get(episode_stats.returned_episode_lengths)),
         global_step,
     )
-    writer.add_scalar(
-        f"charts/{prefix}_learning_rate",
-        getattr(agent_state, "opt_state")[1].hyperparams["learning_rate"].item(),
-        global_step,
-    )
+    if not args.freeze_final_layers_on_transfer:
+        writer.add_scalar(
+            f"charts/{prefix}_learning_rate",
+            getattr(agent_state, "opt_state")[1].hyperparams["learning_rate"].item(),
+            global_step,
+        )
     writer.add_scalar("losses/value_loss", v_loss[-1, -1].item(), global_step)
     writer.add_scalar("losses/policy_loss", pg_loss[-1, -1].item(), global_step)
     writer.add_scalar("losses/entropy", entropy_loss[-1, -1].item(), global_step)
