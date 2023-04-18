@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument("--total-minatar-steps", type=int, default=100000000)
     parser.add_argument("--learning-rate", type=float, default=1e-3,
         help="the learning rate of the optimizer for atari")
+    parser.add_argument("--transfer-learning-rate", type=float, default=1e-3,
+        help="The learning rate to use for the transfer environment")
     parser.add_argument("--transfer-num-envs", type=int, default=8,
         help="the number of parallel game environments")
     parser.add_argument("--minatar-num-envs", type=int, default=128, 
@@ -504,7 +506,7 @@ if __name__ == "__main__":
     transfer_step = 0
     minatar_step = 0
 
-    def linear_schedule(count, use_proxy):
+    def linear_schedule(count, learning_rate, use_proxy):
         # anneal learning rate linearly after one training iteration which contains
         # (args.num_minibatches * args.update_epochs) gradient updates
         num_updates = (
@@ -513,15 +515,17 @@ if __name__ == "__main__":
         frac = (
             1.0 - (count // (args.num_minibatches * args.update_epochs)) / num_updates
         )
-        return args.learning_rate * frac
+        return learning_rate * frac
 
-    def make_opt(use_proxy):
+    def make_opt(learning_rate, use_proxy):
         return optax.chain(
             optax.clip_by_global_norm(args.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(
-                learning_rate=partial(linear_schedule, use_proxy=use_proxy)
+                learning_rate=partial(
+                    linear_schedule, use_proxy=use_proxy, learning_rate=learning_rate
+                )
                 if args.anneal_lr
-                else args.learning_rate,
+                else learning_rate,
                 eps=1e-5,
             ),
         )
@@ -577,7 +581,7 @@ if __name__ == "__main__":
         params=AgentParams(
             atari_params, minatar_params, body_params, actor_params, critic_params
         ),
-        tx=make_opt(use_proxy=True),
+        tx=make_opt(use_proxy=True, learning_rate=args.learning_rate),
     )
     atari_encoder.apply = jax.jit(atari_encoder.apply)
     minatar_encoder.apply = jax.jit(minatar_encoder.apply)
@@ -950,7 +954,12 @@ if __name__ == "__main__":
     if not args.minatar_only:
         if args.freeze_final_layers_on_transfer:
             opt = optax.multi_transform(
-                {"encoder": make_opt(use_proxy=False), "rest": optax.set_to_zero()},
+                {
+                    "encoder": make_opt(
+                        use_proxy=False, learning_rate=args.transfer_learning_rate
+                    ),
+                    "rest": optax.set_to_zero(),
+                },
                 param_labels=AgentParams(
                     atari_params="encoder",
                     minatar_params="encoder",
@@ -960,7 +969,7 @@ if __name__ == "__main__":
                 ),
             )
         else:
-            opt = make_opt(use_proxy=False)
+            opt = make_opt(use_proxy=False, learning_rate=args.transfer_learning_rate)
         if args.reinitialise_encoder:
             atari_params = atari_encoder.init(
                 atari_key, np.array([envs.single_observation_space.sample()])
