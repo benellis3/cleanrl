@@ -26,6 +26,7 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from flax import core
 from flax import struct
+from evosax import ProblemMapper, ParameterReshaper, FitnessShaper, Strategies, ESLog
 from torch.utils.tensorboard import SummaryWriter
 
 
@@ -101,6 +102,28 @@ def parse_args():
         help="Whether to freeze the final layers when transferring from one environment to another")
     parser.add_argument("--reinitialise-encoder", type=lambda x: bool(strtobool(x)), default=False,
         help="Whether to reinitialise the encoder")
+    parser.add_argument("--use-evolution", type=lambda x: bool(strtobool(x)), default=False,
+        help="Whether to use evolution for transfer")
+    parser.add_argument("--es-name", type=str, default="SimpleGA",
+        help="The evolution strategy to use")
+    parser.add_argument("--centered-rank", type=lambda x: strtobool(bool(x)), default=False,
+        help="Argument to the evolution fitness shaper")
+    parser.add_argument("--z-score", type=lambda x: strtobool(bool(x)), default=False,
+        help="Whether to use z score in evolution fitness shaper")
+    parser.add_argument("--maximize", type=lambda x: strtobool(bool(x)), default=True,
+        help="Whether to maximise in the fitness shaper")
+    parser.add_argument("--w-decay", type=float, default=0.01,
+        help="Whether to use weight decay in the fitness shaper")
+    parser.add_argument("--popsize", type=int, default=256,
+        help="The evolution population size")
+    parser.add_argument("--elite-ratio", type=float, default=0.5,
+        help="The ratio to be considered elite")
+    parser.add_argument("--sigma-init", type=float, default=0.2,
+        help="The initial value of sigma")
+    parser.add_argument("--sigma-decay", type=float, default=0.999,
+        help="The decay value of sigma")
+    parser.add_argument("--sigma-limit", type=float, default=0.01,
+        help="The limit for sigma")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -109,6 +132,7 @@ def parse_args():
     args.num_minatar_updates = args.total_minatar_steps // args.minatar_batch_size
     args.num_transfer_updates = args.num_updates
     args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
+    args.evaluate_every_gen = 10
     # fmt: on
     return args
 
@@ -443,6 +467,22 @@ if __name__ == "__main__":
         args.minatar_env_id, args.minatar_num_envs, permute_obs=False
     )()
     minatar_step_env = partial(minatar_envs.step, params=env_params)
+
+    if args.use_evolution:
+        train_evaluator = ProblemMapper["Gym"](
+            num_rollouts=args.transfer_num_envs,
+            env_name=args.minatar_env_id,
+            env_kwargs={},
+            env_params=env_params,
+            test=False,
+        )
+        test_evaluator = ProblemMapper["Gym"](
+            num_rollouts=args.transfer_num_envs,
+            env_name=args.minatar_env_id,
+            env_kwargs={},
+            env_params=env_params,
+            test=True,
+        )
 
     transfer_episode_stats = EpisodeStatistics(
         episode_returns=jnp.zeros(args.transfer_num_envs, dtype=jnp.float32),
@@ -979,65 +1019,158 @@ if __name__ == "__main__":
         else:
             params = agent_state.params
         agent_state = TrainState.create(apply_fn=None, params=params, tx=opt)
-        for update in range(1, args.num_transfer_updates + 1):
-            update_time_start = time.time()
-            (
-                agent_state,
-                transfer_episode_stats,
-                transfer_next_obs,
-                transfer_next_done,
-                transfer_storage,
-                key,
-                transfer_handle,
-            ) = rollout_transfer(
-                agent_state,
-                transfer_episode_stats,
-                transfer_next_obs,
-                transfer_next_done,
-                key,
-                transfer_handle,
-            )
-            storage, next_obs, next_done = (
-                transfer_storage,
-                transfer_next_obs,
-                transfer_next_done,
+        if args.use_evolution:
+            evo_params = (
+                agent_state.params
+                if not args.freeze_final_layers_on_transfer
+                else agent_state.params.minatar_params
             )
 
-            global_step += args.num_steps * args.transfer_num_envs
-            transfer_step += args.num_steps * args.transfer_num_envs
-            use_minatar = args.transfer_environment == "minatar"
-            storage = compute_gae(
-                agent_state,
-                next_obs,
-                next_done,
-                storage,
-                use_minatar=use_minatar,
-                use_proxy=False,
+            train_param_reshaper = ParameterReshaper(evo_params)
+            test_param_reshaper = ParameterReshaper(evo_params, n_devices=1)
+
+            def apply_fn(params, x):
+                body_params = (
+                    params.body_params
+                    if not args.freeze_final_layers_on_transfer
+                    else agent_state.params.body_params
+                )
+                actor_params = (
+                    params.actor_params
+                    if not args.freeze_final_layers_on_transfer
+                    else agent_state.params.actor_params
+                )
+                minatar_params = (
+                    params.minatar_params
+                    if not args.freeze_final_layers_on_transfer
+                    else minatar_params
+                )
+                x = minatar_encoder.apply(params.minatar_params, x)
+                x = body.apply(body_params, x)
+                return actor.apply(actor_params, x)
+
+            train_evaluator.set_apply_fn(train_param_reshaper.vmap_dict, apply_fn)
+            test_evaluator.set_apply_fn(test_param_reshaper.vmap_dict, apply_fn)
+            fitness_shaper = FitnessShaper(
+                maximize=args.maximize,
+                centered_rank=args.centered_rank,
+                z_score=args.z_score,
+                w_decay=args.w_decay,
             )
-            (
-                agent_state,
-                loss,
-                pg_loss,
-                v_loss,
-                entropy_loss,
-                approx_kl,
-                key,
-            ) = update_ppo(agent_state, storage, key, use_minatar)
-            log_stats(
-                writer=writer,
-                episode_stats=transfer_episode_stats,
-                env_step=transfer_step,
-                global_step=global_step,
-                prefix="transfer",
-                update_stats=UpdateStats(
-                    update_time_start=update_time_start,
-                    v_loss=v_loss,
-                    pg_loss=pg_loss,
-                    entropy_loss=entropy_loss,
-                    approx_kl=approx_kl,
-                    loss=loss,
-                ),
+            strategy = Strategies[args.es_name](
+                num_dims=train_param_reshaper.total_params,
+                popsize=args.popsize,
+                elite_ratio=args.elite_ratio,
             )
+            es_params = strategy.default_params.replace(
+                sigma_init=args.sigma_init,
+                sigma_limit=args.sigma_limit,
+                sigma_decay=args.sigma_decay,
+            )
+            # TODO do we need to setup opt params here?
+            es_state = strategy.initialize(es_params)
+            es_logging = ESLog(
+                train_param_reshaper.total_params,
+                args.transfer_num_updates,
+                top_k=5,
+                maximize=args.maximize,
+            )
+            es_log = es_logging.initialize()
+            for gen in range(1, args.num_transfer_updates + 1):
+                key, key_ask, key_eval = jax.random.split(key, 3)
+                # Ask for new parameter proposals and reshape into parameter trees.
+                x, es_state = strategy.ask(key_ask, es_state, es_params)
+                reshaped_params = train_param_reshaper.reshape(x)
+
+                # Rollout population performance, reshape fitness & update strategy.
+                fitness = train_evaluator.rollout(key_eval, reshaped_params).mean(
+                    axis=1
+                )
+                fit_re = fitness_shaper.apply(x, fitness)
+                es_state = strategy.tell(x, fit_re, es_state, es_params)
+                # Update the logging instance.
+                es_log = es_logging.update(es_log, x, fitness)
+                if (gen + 1) % args.evaluate_every_gen == 0:
+                    key, key_test = jax.random.split(key)
+                    # Stack best params seen & mean strategy params for eval
+                    best_params = es_log["top_params"][0]
+                    mean_params = es_state.mean
+                    x_test = jnp.stack([best_params, mean_params], axis=0)
+                    reshaped_test_params = test_param_reshaper.reshape(x_test)
+                    test_fitness = test_evaluator.rollout(
+                        key_test, reshaped_test_params
+                    )
+
+                    test_fitness_to_log = test_fitness.mean(axis=1)[1]
+                    global_step = global_step + train_evaluator.total_env_steps
+                    writer.add_scalar(
+                        "transfer_step", train_evaluator.total_env_steps, global_step
+                    )
+                    writer.add_scalar(
+                        "charts/transfer_avg_episodic_return",
+                        test_fitness_to_log,
+                        global_step,
+                    )
+        else:
+            for update in range(1, args.num_transfer_updates + 1):
+                update_time_start = time.time()
+                (
+                    agent_state,
+                    transfer_episode_stats,
+                    transfer_next_obs,
+                    transfer_next_done,
+                    transfer_storage,
+                    key,
+                    transfer_handle,
+                ) = rollout_transfer(
+                    agent_state,
+                    transfer_episode_stats,
+                    transfer_next_obs,
+                    transfer_next_done,
+                    key,
+                    transfer_handle,
+                )
+                storage, next_obs, next_done = (
+                    transfer_storage,
+                    transfer_next_obs,
+                    transfer_next_done,
+                )
+
+                global_step += args.num_steps * args.transfer_num_envs
+                transfer_step += args.num_steps * args.transfer_num_envs
+                use_minatar = args.transfer_environment == "minatar"
+                storage = compute_gae(
+                    agent_state,
+                    next_obs,
+                    next_done,
+                    storage,
+                    use_minatar=use_minatar,
+                    use_proxy=False,
+                )
+                (
+                    agent_state,
+                    loss,
+                    pg_loss,
+                    v_loss,
+                    entropy_loss,
+                    approx_kl,
+                    key,
+                ) = update_ppo(agent_state, storage, key, use_minatar)
+                log_stats(
+                    writer=writer,
+                    episode_stats=transfer_episode_stats,
+                    env_step=transfer_step,
+                    global_step=global_step,
+                    prefix="transfer",
+                    update_stats=UpdateStats(
+                        update_time_start=update_time_start,
+                        v_loss=v_loss,
+                        pg_loss=pg_loss,
+                        entropy_loss=entropy_loss,
+                        approx_kl=approx_kl,
+                        loss=loss,
+                    ),
+                )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"

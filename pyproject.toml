@@ -99,6 +99,7 @@ jax = "^0.3.17"
 jaxlib = "^0.3.15"
 flax = "^0.6.0"
 gymnax = "0.0.5"
+evosax = "0.1.4"
 
 [tool.poetry.group.optuna]
 optional = true
@@ -150,7 +151,7 @@ plot = ["pandas", "seaborn"]
 pytest = ["pytest"]
 mujoco = ["mujoco", "imageio"]
 mujoco_py = ["free-mujoco-py"]
-jax = ["jax", "jaxlib", "flax"]
+jax = ["jax", "jaxlib", "flax", "gymnax", "evosax"]
 docs = ["mkdocs-material", "markdown-include", "openrlbenchmark"]
 envpool = ["envpool"]
 optuna = ["optuna", "optuna-dashboard", "rich"]
@@ -176,5 +177,6 @@ c51_atari_jax = [
 ppo_atari_envpool_xla_jax_scan = [
     "ale-py", "AutoROM", "opencv-python", # atari
     "jax", "jaxlib", "flax", # jax
-    "envpool", "gymnax" # envpool
+    "envpool", "gymnax", # envpool,
+    "evosax"
 ]
