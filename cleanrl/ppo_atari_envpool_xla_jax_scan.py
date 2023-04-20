@@ -6,7 +6,7 @@ import time
 from distutils.util import strtobool
 from functools import partial
 from typing import Sequence, Any, Callable, NamedTuple
-
+from dataclasses import asdict
 
 os.environ[
     "XLA_PYTHON_CLIENT_MEM_FRACTION"
@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from flax import core
@@ -114,16 +115,8 @@ def parse_args():
         help="Whether to maximise in the fitness shaper")
     parser.add_argument("--w-decay", type=float, default=0.01,
         help="Whether to use weight decay in the fitness shaper")
-    parser.add_argument("--popsize", type=int, default=256,
+    parser.add_argument("--popsize", type=int, default=32,
         help="The evolution population size")
-    parser.add_argument("--elite-ratio", type=float, default=0.5,
-        help="The ratio to be considered elite")
-    parser.add_argument("--sigma-init", type=float, default=0.2,
-        help="The initial value of sigma")
-    parser.add_argument("--sigma-decay", type=float, default=0.999,
-        help="The decay value of sigma")
-    parser.add_argument("--sigma-limit", type=float, default=0.01,
-        help="The limit for sigma")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -290,7 +283,7 @@ class AtariEncoder(nn.Module):
         )(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+        x = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
             x
         )
         x = nn.relu(x)
@@ -300,7 +293,7 @@ class AtariEncoder(nn.Module):
 class SharedActorCriticBody(nn.Module):
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+        x = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
             x
         )
         x = nn.relu(x)
@@ -312,14 +305,14 @@ class MinAtarEncoder(nn.Module):
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
 
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+        x = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
             x
         )
         x = nn.relu(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
-            x
-        )
-        x = nn.relu(x)
+        # x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+        #     x
+        # )
+        # x = nn.relu(x)
         return x
 
 
@@ -469,18 +462,18 @@ if __name__ == "__main__":
     minatar_step_env = partial(minatar_envs.step, params=env_params)
 
     if args.use_evolution:
-        train_evaluator = ProblemMapper["Gym"](
+        train_evaluator = ProblemMapper["Gymnax"](
             num_rollouts=args.transfer_num_envs,
             env_name=args.minatar_env_id,
             env_kwargs={},
-            env_params=env_params,
+            env_params=asdict(env_params),
             test=False,
         )
-        test_evaluator = ProblemMapper["Gym"](
+        test_evaluator = ProblemMapper["Gymnax"](
             num_rollouts=args.transfer_num_envs,
             env_name=args.minatar_env_id,
             env_kwargs={},
-            env_params=env_params,
+            env_params=asdict(env_params),
             test=True,
         )
 
@@ -1029,7 +1022,7 @@ if __name__ == "__main__":
             train_param_reshaper = ParameterReshaper(evo_params)
             test_param_reshaper = ParameterReshaper(evo_params, n_devices=1)
 
-            def apply_fn(params, x):
+            def apply_fn(params, x, rng):
                 body_params = (
                     params.body_params
                     if not args.freeze_final_layers_on_transfer
@@ -1043,14 +1036,19 @@ if __name__ == "__main__":
                 minatar_params = (
                     params.minatar_params
                     if not args.freeze_final_layers_on_transfer
-                    else minatar_params
+                    else params
                 )
-                x = minatar_encoder.apply(params.minatar_params, x)
+                if x.ndim == 3:
+                    x = jnp.expand_dims(x, axis=0)
+                x = minatar_encoder.apply(minatar_params, x)
                 x = body.apply(body_params, x)
-                return actor.apply(actor_params, x)
+                logits = actor.apply(actor_params, x)
+                u = jax.random.uniform(rng, shape=logits.shape)
+                action = jnp.argmax(logits - jnp.log(-jnp.log(u))) 
+                return action
 
-            train_evaluator.set_apply_fn(train_param_reshaper.vmap_dict, apply_fn)
-            test_evaluator.set_apply_fn(test_param_reshaper.vmap_dict, apply_fn)
+            train_evaluator.set_apply_fn(apply_fn, carry_init=None)
+            test_evaluator.set_apply_fn(apply_fn, carry_init=None)
             fitness_shaper = FitnessShaper(
                 maximize=args.maximize,
                 centered_rank=args.centered_rank,
@@ -1058,20 +1056,21 @@ if __name__ == "__main__":
                 w_decay=args.w_decay,
             )
             strategy = Strategies[args.es_name](
-                num_dims=train_param_reshaper.total_params,
+                pholder_params=evo_params,
                 popsize=args.popsize,
-                elite_ratio=args.elite_ratio,
             )
-            es_params = strategy.default_params.replace(
-                sigma_init=args.sigma_init,
-                sigma_limit=args.sigma_limit,
-                sigma_decay=args.sigma_decay,
-            )
+            # es_params = strategy.default_params.replace(
+            #     sigma_init=args.sigma_init,
+            #     sigma_limit=args.sigma_limit,
+            #     sigma_decay=args.sigma_decay,
+            # )
+            es_params = strategy.default_params
             # TODO do we need to setup opt params here?
-            es_state = strategy.initialize(es_params)
+            key, init_key = jax.random.split(key)
+            es_state = strategy.initialize(init_key, es_params)
             es_logging = ESLog(
-                train_param_reshaper.total_params,
-                args.transfer_num_updates,
+                pholder_params=evo_params,
+                num_generations=args.num_transfer_updates,
                 top_k=5,
                 maximize=args.maximize,
             )
@@ -1080,14 +1079,11 @@ if __name__ == "__main__":
                 key, key_ask, key_eval = jax.random.split(key, 3)
                 # Ask for new parameter proposals and reshape into parameter trees.
                 x, es_state = strategy.ask(key_ask, es_state, es_params)
-                reshaped_params = train_param_reshaper.reshape(x)
 
                 # Rollout population performance, reshape fitness & update strategy.
-                fitness = train_evaluator.rollout(key_eval, reshaped_params).mean(
-                    axis=1
-                )
-                fit_re = fitness_shaper.apply(x, fitness)
-                es_state = strategy.tell(x, fit_re, es_state, es_params)
+
+                fitness = train_evaluator.rollout(key_eval, x).mean(axis=1)
+                es_state = strategy.tell(x, fitness, es_state, es_params)
                 # Update the logging instance.
                 es_log = es_logging.update(es_log, x, fitness)
                 if (gen + 1) % args.evaluate_every_gen == 0:
@@ -1101,14 +1097,16 @@ if __name__ == "__main__":
                         key_test, reshaped_test_params
                     )
 
-                    test_fitness_to_log = test_fitness.mean(axis=1)[1]
+                    test_fitness_mean = test_fitness.mean(axis=1)[1]
+                    test_fitness_best = test_fitness.mean(axis=1)[0]
                     global_step = global_step + train_evaluator.total_env_steps
+                    print(f"global_step: {global_step.item()}, transfer_avg_episodic_return: {test_fitness_best.item()}")
                     writer.add_scalar(
-                        "transfer_step", train_evaluator.total_env_steps, global_step
+                        "transfer_step", train_evaluator.total_env_steps.item(), global_step
                     )
                     writer.add_scalar(
                         "charts/transfer_avg_episodic_return",
-                        test_fitness_to_log,
+                        test_fitness_best.item(),
                         global_step,
                     )
         else:

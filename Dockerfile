@@ -16,7 +16,7 @@ COPY poetry.lock poetry.lock
 # RUN poetry install --no-root --with pybullet
 RUN poetry install --no-root -E "jax envpool"
 RUN poetry run pip install --upgrade "jax[cuda]==0.3.17" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-RUN poetry run pip install gymnax
+RUN poetry run pip install gymnax evosax
 RUN poetry run python -c "import jax"
 
 # install mujoco_py
