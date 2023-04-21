@@ -964,7 +964,7 @@ if __name__ == "__main__":
                     atari_params="encoder",
                     minatar_params="encoder",
                     body_params="rest",
-                    actor_params="rest",
+                    actor_params="encoder", # different action spaces for atari and minatar
                     critic_params="rest",
                 ),
             )
