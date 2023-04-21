@@ -322,7 +322,8 @@ class AgentParams:
     atari_params: flax.core.FrozenDict
     minatar_params: flax.core.FrozenDict
     body_params: flax.core.FrozenDict
-    actor_params: flax.core.FrozenDict
+    minatar_actor_params: flax.core.FrozenDict
+    atari_actor_params: flax.core.FrozenDict
     critic_params: flax.core.FrozenDict
 
 
@@ -422,7 +423,7 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     key = jax.random.PRNGKey(args.seed)
-    key, minatar_key, atari_key, body_key, actor_key, critic_key = jax.random.split(
+    key, minatar_key, atari_key, body_key, minatar_actor_key, atari_actor_key, critic_key = jax.random.split(
         key, 6
     )
 
@@ -538,7 +539,8 @@ if __name__ == "__main__":
         if args.transfer_environment == "atari"
         else minatar_envs.action_space(env_params).n
     )
-    actor = Actor(action_dim=action_dim)
+    atari_actor = Actor(action_dim=envs.single_action_space.n)
+    minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
     critic = Critic()
     key, init_key = jax.random.split(key)
     atari_params = atari_encoder.init(
@@ -555,8 +557,8 @@ if __name__ == "__main__":
             atari_params, np.array([envs.single_observation_space.sample()])
         ),
     )
-    actor_params = actor.init(
-        actor_key,
+    atari_actor_params = atari_actor.init(
+        atari_actor_key,
         body.apply(
             body_params,
             atari_encoder.apply(
@@ -564,6 +566,16 @@ if __name__ == "__main__":
                 np.array([envs.single_observation_space.sample()]),
             ),
         ),
+    )
+    minatar_actor_params = minatar_actor.init(
+        minatar_actor_key,
+        body.apply(
+            body_params,
+            atari_encoder.apply(
+                atari_params,
+                np.array([envs.single_observation_space.sample()]),
+            ),
+        ), # just a latent sample -- not an issue it's encoded by atari
     )
     critic_params = critic.init(
         critic_key,
@@ -579,14 +591,20 @@ if __name__ == "__main__":
     agent_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
-            atari_params, minatar_params, body_params, actor_params, critic_params
+            atari_params=atari_params,
+            minatar_params=minatar_params,
+            body_params=body_params,
+            minatar_actor_params=minatar_actor_params,
+            atari_actor_params=atari_actor_params,
+            critic_params=critic_params
         ),
         tx=make_opt(use_proxy=True, learning_rate=args.learning_rate),
     )
     atari_encoder.apply = jax.jit(atari_encoder.apply)
     minatar_encoder.apply = jax.jit(minatar_encoder.apply)
     body.apply = jax.jit(body.apply)
-    actor.apply = jax.jit(actor.apply)
+    minatar_actor.apply = jax.jit(minatar_actor.apply)
+    atari_actor.apply = jax.jit(atari_actor.apply)
     critic.apply = jax.jit(critic.apply)
 
     @partial(jax.jit, static_argnums=(3,))
@@ -598,14 +616,20 @@ if __name__ == "__main__":
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
         encoder = atari_encoder if not use_minatar else minatar_encoder
-        params = (
+        actor = atari_actor if not use_minatar else minatar_actor
+        encoder_params = (
             agent_state.params.atari_params
             if not use_minatar
             else agent_state.params.minatar_params
         )
-        hidden = encoder.apply(params, next_obs)
+        actor_params = (
+            agent_state.params.atari_actor_params
+            if not use_minatar
+            else agent_state.params.minatar_actor_params
+        )
+        hidden = encoder.apply(encoder_params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
-        logits = actor.apply(agent_state.params.actor_params, hidden)
+        logits = actor.apply(actor_params, hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
         key, subkey = jax.random.split(key)
@@ -627,9 +651,12 @@ if __name__ == "__main__":
         encoder_params = (
             params.atari_params if not use_minatar else params.minatar_params
         )
+        actor = atari_actor if not use_minatar else minatar_actor
+        actor_params = (params.atari_actor_params if not use_minatar else params.minatar_actor_params)
+
         hidden = encoder.apply(encoder_params, x)
         hidden = body.apply(params.body_params, hidden)
-        logits = actor.apply(params.actor_params, hidden)
+        logits = actor.apply(actor_params, hidden)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
         # normalize the logits https://gregorygundersen.com/blog/2020/02/09/log-sum-exp/
         logits = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
@@ -964,7 +991,8 @@ if __name__ == "__main__":
                     atari_params="encoder",
                     minatar_params="encoder",
                     body_params="rest",
-                    actor_params="encoder", # different action spaces for atari and minatar
+                    minatar_actor_params="rest",
+                    atari_actor_params="encoder",
                     critic_params="rest",
                 ),
             )
@@ -982,7 +1010,8 @@ if __name__ == "__main__":
                 atari_params=atari_params,
                 minatar_params=minatar_params,
                 body_params=agent_state.params.body_params,
-                actor_params=agent_state.params.actor_params,
+                atari_actor_params=agent_state.params.atari_actor_params,
+                minatar_actor_params=agent_state.params.minatar_actor_params,
                 critic_params=agent_state.params.critic_params,
             )
         else:
@@ -1059,7 +1088,8 @@ if __name__ == "__main__":
                             agent_state.params.atari_params,
                             agent_state.params.minatar_params,
                             agent_state.params.body_params,
-                            agent_state.params.actor_params,
+                            agent_state.params.minatar_actor_params,
+                            agent_state.params.atari_actor_params,
                             agent_state.params.critic_params,
                         ],
                     ]
