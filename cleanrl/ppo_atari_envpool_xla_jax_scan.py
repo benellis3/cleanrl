@@ -160,6 +160,10 @@ class VectorizedGymnaxWrapper(GymnaxWrapper):
         self.num_envs = num_envs
 
     @partial(jax.jit, static_argnums=(0,))
+    def permute_obs(self, obs):
+        return jax.vmap(self._env.permute_obs)(obs)
+
+    @partial(jax.jit, static_argnums=(0,))
     def reset(self, key, params):
         keys = jax.random.split(key, self.num_envs)
         return jax.vmap(self._env.reset, (0, None))(keys, params)
@@ -182,7 +186,6 @@ class EnvPoolAutoResetWrapper(GymnaxWrapper):
         key, key_reset = jax.random.split(key)
         obs, state_st, reward, done, info = self.step_env(key, state, action, params)
         _, state_re = self.reset_env(key_reset, params)
-
         state = jax.tree_map(
             lambda x, y: jax.lax.select(done, x, y), state_re, state_st
         )
