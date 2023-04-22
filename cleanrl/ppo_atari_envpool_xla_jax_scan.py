@@ -103,6 +103,10 @@ def parse_args():
         help="Whether to freeze the final layers when transferring from one environment to another")
     parser.add_argument("--reinitialise-encoder", type=lambda x: bool(strtobool(x)), default=False,
         help="Whether to reinitialise the encoder")
+    parser.add_argument("--num-minatar-encoder-layers", type=int, default=1,
+        help="The number of layers to put in the MinAtar Encoder")
+    parser.add_argument("--num-body-layers", type=int, default=2,
+        help="The number of layers to put in the shared body between the actor and critic")
     args = parser.parse_args()
     args.transfer_batch_size = int(args.transfer_num_envs * args.num_steps)
     args.minatar_batch_size = int(args.minatar_num_envs * args.num_steps)
@@ -279,28 +283,30 @@ class AtariEncoder(nn.Module):
 
 
 class SharedActorCriticBody(nn.Module):
+    num_layers: int
+
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
-            x
-        )
-        x = nn.relu(x)
+        for _ in range(self.num_layers):
+            x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+                x
+            )
+            x = nn.relu(x)
         return x
 
 
 class MinAtarEncoder(nn.Module):
+    num_layers: int
+
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
-
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
-            x
-        )
-        x = nn.relu(x)
-        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
-            x
-        )
-        x = nn.relu(x)
+        for _ in range(self.num_layers):
+            x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(
+                x
+            )
+            x = nn.relu(x)
+            
         return x
 
 
@@ -535,8 +541,8 @@ if __name__ == "__main__":
         )
 
     atari_encoder = AtariEncoder()
-    minatar_encoder = MinAtarEncoder()
-    body = SharedActorCriticBody()
+    minatar_encoder = MinAtarEncoder(args.num_minatar_encoder_layers)
+    body = SharedActorCriticBody(args.num_body_layers)
     action_dim = (
         envs.single_action_space.n
         if args.transfer_environment == "atari"
