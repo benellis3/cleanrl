@@ -25,6 +25,7 @@ from cleanrl.ppo_atari_envpool_xla_jax_scan import (
 )
 import numpy as np
 
+
 @flax.struct.dataclass
 class Storage:
     minatar_obs: jnp.array
@@ -33,6 +34,7 @@ class Storage:
     logprobs: jnp.array
     dones: jnp.array
     values: jnp.array
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -103,28 +105,22 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout",
     )
     parser.add_argument(
-        "--params-dir",
-        type=str,
-        default="",
-        help="Where to load the parameters from"
+        "--params-dir", type=str, default="", help="Where to load the parameters from"
     )
     parser.add_argument(
-        "--num-minibatches",
-        type=int,
-        default=4,
-        help="The number of minibatches to do"
+        "--num-minibatches", type=int, default=4, help="The number of minibatches to do"
     )
     parser.add_argument(
         "--update-epochs",
         type=int,
         default=1,
-        help="The number of epochs to update for"
+        help="The number of epochs to update for",
     )
     parser.add_argument(
         "--evaluation-frequency",
         type=int,
         default=1,
-        help="The frequency with which to evaluate the learned policy"
+        help="The frequency with which to evaluate the learned policy",
     )
     return parser.parse_args()
 
@@ -176,7 +172,7 @@ if __name__ == "__main__":
         returned_episode_returns=jnp.zeros(args.minatar_num_envs, dtype=jnp.float32),
         returned_episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
     )
-    
+
     minatar_encoder = MinAtarEncoder()
     body = SharedActorCriticBody()
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
@@ -199,6 +195,7 @@ if __name__ == "__main__":
             ),
         )
         return episode_stats, env_state, (obs, reward, done, info)
+
     @partial(jax.jit, static_argnums=(3,))
     def get_action_and_value(
         agent_state: TrainState,
@@ -221,9 +218,7 @@ if __name__ == "__main__":
 
     def step_once(carry, step, minatar_env_step_fn, permute_fn=None, permute_obs=False):
         agent_state, episode_stats, obs, done, key, handle = carry
-        action, logprob, value, key = get_action_and_value(
-            agent_state, obs, key
-        )
+        action, logprob, value, key = get_action_and_value(agent_state, obs, key)
 
         key, env_key = jax.random.split(key)
         episode_stats, handle, (next_obs, _, next_done, _) = minatar_env_step_fn(
@@ -264,6 +259,7 @@ if __name__ == "__main__":
             max_steps,
         )
         return agent_state, episode_stats, next_obs, next_done, storage, key, handle
+
     rollout_minatar = partial(
         rollout,
         step_once_fn=partial(
@@ -289,11 +285,17 @@ if __name__ == "__main__":
         ),
         max_steps=args.num_steps,
     )
-    
+
     # load the parameters
-    key, minatar_key, atari_key, body_key, minatar_actor_key, atari_actor_key, critic_key = jax.random.split(
-        key, 7
-    )
+    (
+        key,
+        minatar_key,
+        atari_key,
+        body_key,
+        minatar_actor_key,
+        atari_actor_key,
+        critic_key,
+    ) = jax.random.split(key, 7)
     key, init_key = jax.random.split(key)
     minatar_params = minatar_encoder.init(
         minatar_key,
@@ -303,7 +305,8 @@ if __name__ == "__main__":
     body_params = body.init(
         body_key,
         minatar_encoder.apply(
-            minatar_params, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+            minatar_params,
+            np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
         ),
     )
     minatar_actor_params = minatar_actor.init(
@@ -311,16 +314,18 @@ if __name__ == "__main__":
         body.apply(
             body_params,
             minatar_encoder.apply(
-                minatar_params, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+                minatar_params,
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             ),
-        ), # just a latent sample -- not an issue it's encoded by atari
+        ),  # just a latent sample -- not an issue it's encoded by atari
     )
     critic_params = critic.init(
         critic_key,
         body.apply(
             body_params,
             minatar_encoder.apply(
-                minatar_params, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+                minatar_params,
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             ),
         ),
     )
@@ -333,24 +338,31 @@ if __name__ == "__main__":
                 eps=1e-5,
             ),
         )
-    bc_state = TrainState(apply_fn=None, params=AgentParams(
+
+    bc_state = TrainState(
+        apply_fn=None,
+        params=AgentParams(
             minatar_params=minatar_params,
             body_params=body_params,
             minatar_actor_params=minatar_actor_params,
-            critic_params=critic_params
+            critic_params=critic_params,
         ),
-        opt=make_opt(args.learning_rate)
+        opt=make_opt(args.learning_rate),
     )
-    restored_state = TrainState(apply_fn=None, params=AgentParams(
+    restored_state = TrainState(
+        apply_fn=None,
+        params=AgentParams(
             minatar_params=minatar_params,
             body_params=body_params,
             minatar_actor_params=minatar_actor_params,
-            critic_params=critic_params
+            critic_params=critic_params,
         ),
-        opt=make_opt(args.learning_rate)
+        opt=make_opt(args.learning_rate),
     )
-    params = checkpoints.restore_checkpoint(ckpt_dir=args.params_dir, target=restored_state)
-    
+    params = checkpoints.restore_checkpoint(
+        ckpt_dir=args.params_dir, target=restored_state
+    )
+
     # freeze and reinitialise appropriately
 
     @jax.jit
@@ -359,12 +371,18 @@ if __name__ == "__main__":
         x = minatar_encoder.apply(bc_state.params.minatar_params, storage.transfer_obs)
         x = body.apply(bc_state.params.body_params, x)
         action_logits = body.apply(bc_state.params.actor_params, x)
-        loss = jnp.exp(storage.logprobs) * (jnp.where(storage.logprobs == 0.0, 0, storage.logprobs)) - action_logits
+        loss = (
+            jnp.exp(storage.logprobs)
+            * (jnp.where(storage.logprobs == 0.0, 0, storage.logprobs))
+            - action_logits
+        )
         return jnp.sum(loss, axis=-1)
 
     bc_loss_grad_fn = jax.value_and_grad(compute_bc_loss)
 
-    def update_bc_state(bc_state: TrainState, storage: Storage, key: jax.random.PRNGKey):
+    def update_bc_state(
+        bc_state: TrainState, storage: Storage, key: jax.random.PRNGKey
+    ):
         def update_bc_state_epoch(carry, _):
             bc_state, key = carry
             key, subkey = jax.random.split(key)
@@ -380,10 +398,12 @@ if __name__ == "__main__":
 
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
+
             def update_bc_state_minibatch(bc_state: TrainState, storage: Storage):
                 loss, grads = bc_loss_grad_fn(bc_state, storage)
                 bc_state = bc_state.apply_gradients(grads=grads)
                 return bc_state, (loss, grads)
+
             bc_state, (
                 loss,
                 grads,
@@ -392,6 +412,7 @@ if __name__ == "__main__":
                 loss,
                 grads,
             )
+
         (bc_state, key), (
             loss,
             grads,
@@ -399,6 +420,7 @@ if __name__ == "__main__":
             update_bc_state_epoch, (bc_state, key), (), length=args.update_epochs
         )
         return bc_state, loss, grads, key
+
     key, reset_key = jax.random.split(key)
     transfer_next_obs, transfer_handle = permuted_minatar_envs.reset(
         reset_key, permuted_minatar_env_params
@@ -432,7 +454,9 @@ if __name__ == "__main__":
         avg_episodic_return = np.mean(
             jax.device_get(minatar_episode_stats.returned_episode_returns)
         )
-        writer.add_scalar("charts/demo_policy_avg_episode_return",  avg_episodic_return, global_step)
+        writer.add_scalar(
+            "charts/demo_policy_avg_episode_return", avg_episodic_return, global_step
+        )
 
         if update % args.evaluation_frequency == 0:
             (
@@ -442,18 +466,18 @@ if __name__ == "__main__":
                 transfer_next_done,
                 transfer_storage,
                 key,
-                transfer_handle
+                transfer_handle,
             ) = rollout_transfer(
                 bc_state,
                 transfer_episode_stats,
                 transfer_next_obs,
                 transfer_next_done,
                 key,
-                transfer_handle
+                transfer_handle,
             )
             avg_episodic_return = np.mean(
                 jax.device_get(transfer_episode_stats.returned_episode_returns)
             )
-            writer.add_scalar("charts/bc_policy_avg_episode_return", avg_episodic_return, global_step)
-
-
+            writer.add_scalar(
+                "charts/bc_policy_avg_episode_return", avg_episodic_return, global_step
+            )

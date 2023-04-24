@@ -241,18 +241,6 @@ files = [
 ]
 
 [[package]]
-name = "cached-property"
-version = "1.5.2"
-description = "A decorator for caching properties in classes."
-category = "main"
-optional = false
-python-versions = "*"
-files = [
-    {file = "cached-property-1.5.2.tar.gz", hash = "sha256:9fa5755838eecbb2d234c3aa390bd80fbd3ac6b6869109bfc1b499f7bd89a130"},
-    {file = "cached_property-1.5.2-py2.py3-none-any.whl", hash = "sha256:df4f613cf7ad9a588cc381aaf4a512d26265ecebd5eb9e1ba12f1319eb85a6a0"},
-]
-
-[[package]]
 name = "cachetools"
 version = "5.3.0"
 description = "Extensible memoizing collections and decorators"
@@ -821,35 +809,6 @@ types-protobuf = ">=3.17.3"
 typing-extensions = "*"
 
 [[package]]
-name = "etils"
-version = "0.9.0"
-description = "Collection of common python utils"
-category = "main"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "etils-0.9.0-py3-none-any.whl", hash = "sha256:635d6f7d1c519eb194304228543a4c5c7df0e6b58243302473e34c18cf720588"},
-    {file = "etils-0.9.0.tar.gz", hash = "sha256:489103e9e499a566765c60458ee15d185cf0065f2060a4d16a68f8f46962ed0d"},
-]
-
-[package.extras]
-all = ["etils[array-types]", "etils[eapp]", "etils[ecolab]", "etils[edc]", "etils[enp]", "etils[epath]", "etils[epy]", "etils[etqdm]", "etils[etree-dm]", "etils[etree-jax]", "etils[etree-tf]", "etils[etree]"]
-array-types = ["etils[enp]"]
-dev = ["chex", "pylint (>=2.6.0)", "pytest", "pytest-subtests", "pytest-xdist", "yapf"]
-eapp = ["absl-py", "simple_parsing"]
-ecolab = ["etils[enp]", "etils[epy]", "jupyter", "mediapy", "numpy"]
-edc = ["etils[epy]", "typing_extensions"]
-enp = ["etils[epy]", "numpy"]
-epath = ["etils[epy]", "importlib_resources", "typing_extensions", "zipp"]
-epy = ["typing_extensions"]
-etqdm = ["absl-py", "etils[epy]", "tqdm"]
-etree = ["etils[array-types]", "etils[enp]", "etils[epy]", "etils[etqdm]"]
-etree-dm = ["dm-tree", "etils[etree]"]
-etree-jax = ["etils[etree]", "jax[cpu]"]
-etree-tf = ["etils[etree]", "tf-nightly"]
-lazy-imports = ["etils[ecolab]"]
-
-[[package]]
 name = "exceptiongroup"
 version = "1.1.1"
 description = "Backport of PEP 654 (exception groups)"
@@ -921,14 +880,14 @@ testing = ["covdefaults (>=2.3)", "coverage (>=7.2.3)", "diff-cover (>=7.5)", "p
 
 [[package]]
 name = "flax"
-version = "0.6.4"
+version = "0.6.0"
 description = "Flax: A neural network library for JAX designed for flexibility"
 category = "main"
 optional = false
 python-versions = "*"
 files = [
-    {file = "flax-0.6.4-py3-none-any.whl", hash = "sha256:fe5010525202241fdc960920033d2e4c0b35f06090c1ad9e280b1f4415ae308f"},
-    {file = "flax-0.6.4.tar.gz", hash = "sha256:d06465a3e6636c3c23c29f651a13f5367d06c41373b441dc8ec1bfaa4db06a48"},
+    {file = "flax-0.6.0-py3-none-any.whl", hash = "sha256:98197d17a82bb239c13d9317508cc4cee8daf8728e8db8fcfbe80277a7dfd9e6"},
+    {file = "flax-0.6.0.tar.gz", hash = "sha256:6d9bc9d5e86291610e646c945a314912a8769508aa95ed751790f983f6e29c3d"},
 ]
 
 [package.dependencies]
@@ -937,14 +896,12 @@ matplotlib = "*"
 msgpack = "*"
 numpy = ">=1.12"
 optax = "*"
-orbax = "*"
 PyYAML = ">=5.4.1"
-rich = ">=11.1"
-tensorstore = "*"
+rich = ">=11.1,<12.0"
 typing-extensions = ">=4.1.1"
 
 [package.extras]
-testing = ["atari-py (==0.2.5)", "clu", "gym (==0.18.3)", "jaxlib", "jraph (>=0.0.6dev0)", "ml-collections", "mypy", "opencv-python", "pytest", "pytest-cov", "pytest-custom-exit-code", "pytest-xdist (==1.34.0)", "pytype", "sentencepiece", "tensorflow", "tensorflow-datasets", "tensorflow-text (>=2.4.0)", "torch"]
+testing = ["atari-py (==0.2.5)", "clu", "gym (==0.18.3)", "jaxlib", "jraph (>=0.0.6dev0)", "ml-collections", "opencv-python", "pytest", "pytest-cov", "pytest-custom-exit-code", "pytest-xdist (==1.34.0)", "pytype", "sentencepiece", "svn", "tensorflow", "tensorflow-datasets", "tensorflow-text (>=2.4.0)", "torch"]
 
 [[package]]
 name = "fonttools"
@@ -2830,34 +2787,6 @@ scikit-learn = "*"
 typing-extensions = {version = "*", markers = "python_version < \"3.8\""}
 
 [[package]]
-name = "orbax"
-version = "0.1.0"
-description = "Orbax"
-category = "main"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "orbax-0.1.0-py3-none-any.whl", hash = "sha256:df2b5534cb379e1c72a8829bbb62a2c7ebc0e06567ad98e4b06e6aced5d231b1"},
-    {file = "orbax-0.1.0.tar.gz", hash = "sha256:317fae101b504dfea9204d667fd79ad7039395b123356995e13a01332e996595"},
-]
-
-[package.dependencies]
-absl-py = "*"
-cached_property = "*"
-etils = "*"
-flax = "*"
-importlib_resources = "*"
-jax = "*"
-jaxlib = "*"
-numpy = "*"
-pytest = "*"
-pyyaml = "*"
-tensorstore = ">=0.1.20"
-
-[package.extras]
-dev = ["pytest-xdist"]
-
-[[package]]
 name = "packaging"
 version = "23.1"
 description = "Core utilities for Python packages"
@@ -4317,35 +4246,6 @@ packaging = "*"
 protobuf = ">=3.8.0,<4"
 
 [[package]]
-name = "tensorstore"
-version = "0.1.28"
-description = "Read and write large, multi-dimensional arrays"
-category = "main"
-optional = false
-python-versions = ">=3.7"
-files = [
-    {file = "tensorstore-0.1.28-cp310-cp310-macosx_10_14_x86_64.whl", hash = "sha256:deb32f1e74ab7b836ecec02a759a558fc57522a8dea0db4f19a01a78e93abab5"},
-    {file = "tensorstore-0.1.28-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:bd8615308ad3e29111238dfdd3aca1f3fb79b55c3dac1c04c96c8a319985addf"},
-    {file = "tensorstore-0.1.28-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ee16297a9493ed0d6d1000f216e79d29a0b80e7e97646e8520afd44138165839"},
-    {file = "tensorstore-0.1.28-cp310-cp310-win_amd64.whl", hash = "sha256:b6f7e0c7455d9e164e6143714519e7c96cc4166b61ed7d268a8ab84a77e0d593"},
-    {file = "tensorstore-0.1.28-cp37-cp37m-macosx_10_14_x86_64.whl", hash = "sha256:1c53e1e0e7996b8ba41854135d748c2bc8802b94a79122b56448aeb1f77efd9f"},
-    {file = "tensorstore-0.1.28-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6bd122a44db81369808c84b7739ad2d8453f89c548c5d61d62f2b1f3331dbe9f"},
-    {file = "tensorstore-0.1.28-cp37-cp37m-win_amd64.whl", hash = "sha256:197159da3ee97c08d8769fa151ff167328108bf07a13886f688b21f64abfb7d6"},
-    {file = "tensorstore-0.1.28-cp38-cp38-macosx_10_14_x86_64.whl", hash = "sha256:e480da4f95f7c95302c4b3e2a7fc32b8cfe1aa51742d72f84a335e49462a2465"},
-    {file = "tensorstore-0.1.28-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:7948ead0d5a55303ffa97a35659aa56a20c60bd89d9487643f51ac8d2e19b52c"},
-    {file = "tensorstore-0.1.28-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:818aeb015b249069a686fb20f0c0b71663410ac6411cee88df18b8e05b567cbc"},
-    {file = "tensorstore-0.1.28-cp38-cp38-win_amd64.whl", hash = "sha256:6719eaba4ec2692d890c3c67c389fcae073d40d9e8c27e2dabd27fc9fd745e5c"},
-    {file = "tensorstore-0.1.28-cp39-cp39-macosx_10_14_x86_64.whl", hash = "sha256:d7c86f63a6d4d7a84e3201ba9746ca51015612d375d77b9302eb93e9b88bc7aa"},
-    {file = "tensorstore-0.1.28-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:dc82cbb77255fd2f7aa191f1e030f13276bf7272ea1027fcc6900537b30bfbcb"},
-    {file = "tensorstore-0.1.28-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c4de09e3fae30f8a9ab7648600c78e109ddd1d14af4280e055439fdd52a6dca9"},
-    {file = "tensorstore-0.1.28-cp39-cp39-win_amd64.whl", hash = "sha256:f9270586401ee60ff79a4cd54c62ab5b06831d69b561df1fb9ebbeade4d4929c"},
-    {file = "tensorstore-0.1.28.tar.gz", hash = "sha256:cd8d8185136632c58edcd7cf4c43d301bf8ad61a197c632cb495d7d33b7be04e"},
-]
-
-[package.dependencies]
-numpy = ">=1.16.0"
-
-[[package]]
 name = "termcolor"
 version = "1.1.0"
 description = "ANSII Color formatting for output in terminal."
@@ -4759,4 +4659,4 @@ pytest = ["pytest"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.7.1,<3.10"
-content-hash = "491458ba5227fa0a6c8135d72d7ad91126b896e1c3a74c12a76e2cea9a2397d3"
+content-hash = "d406188001311549c16154d7747f785c89b4f9aea42389d57f5633dcdfccac7a"
