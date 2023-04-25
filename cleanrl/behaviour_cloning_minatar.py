@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import gymnax
 from gymnax.environments import environment
-from cleanrl.ppo_atari_envpool_xla_jax_scan import (
+from .ppo_atari_envpool_xla_jax_scan import (
     make_gymnax_env,
     AtariEncoder,
     MinAtarEncoder,
@@ -72,7 +72,13 @@ def parse_args():
         help="The environment to transfer to (either atari or permuted MinAtar)",
     )
     parser.add_argument(
-        "--env-id", type=str, default="Pong-v5", help="the id of the environment"
+        "--env-id", type=str, default="Breakout-v5", help="the id of the environment"
+    )
+    parser.add_argument(
+        "--learning-rate", type=float, default=1e-3, help="The learning rate to use"
+    )
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=0.5, help="The maximum gradient norm"
     )
     parser.add_argument(
         "--transfer-num-envs",
@@ -105,6 +111,18 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout",
     )
     parser.add_argument(
+        "--num-encoder-layers",
+        type=int,
+        default=1,
+        help="The number of layers to have in the minatar encoder"
+    )
+    parser.add_argument(
+        "--num-body-layers",
+        type=int,
+        default=1,
+        help="The number of layers to have in the body of the network"
+    )
+    parser.add_argument(
         "--params-dir", type=str, default="", help="Where to load the parameters from"
     )
     parser.add_argument(
@@ -122,8 +140,9 @@ def parse_args():
         default=1,
         help="The frequency with which to evaluate the learned policy",
     )
-    return parser.parse_args()
-
+    args = parser.parse_args()
+    args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
+    return args
 
 @flax.struct.dataclass
 class AgentParams:
@@ -173,8 +192,8 @@ if __name__ == "__main__":
         returned_episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
     )
 
-    minatar_encoder = MinAtarEncoder()
-    body = SharedActorCriticBody()
+    minatar_encoder = MinAtarEncoder(num_layers=args.num_encoder_layers)
+    body = SharedActorCriticBody(num_layers=args.num_body_layers)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
     critic = Critic()
 
@@ -339,7 +358,7 @@ if __name__ == "__main__":
             ),
         )
 
-    bc_state = TrainState(
+    bc_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
             minatar_params=minatar_params,
@@ -347,9 +366,9 @@ if __name__ == "__main__":
             minatar_actor_params=minatar_actor_params,
             critic_params=critic_params,
         ),
-        opt=make_opt(args.learning_rate),
+        tx=make_opt(args.learning_rate),
     )
-    restored_state = TrainState(
+    restored_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
             minatar_params=minatar_params,
@@ -357,7 +376,7 @@ if __name__ == "__main__":
             minatar_actor_params=minatar_actor_params,
             critic_params=critic_params,
         ),
-        opt=make_opt(args.learning_rate),
+        tx=make_opt(args.learning_rate),
     )
     params = checkpoints.restore_checkpoint(
         ckpt_dir=args.params_dir, target=restored_state
