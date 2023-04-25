@@ -22,7 +22,9 @@ from .ppo_atari_envpool_xla_jax_scan import (
     Critic,
     Actor,
     EpisodeStatistics,
+    parse_args,
 )
+from .ppo_atari_envpool_xla_jax_scan import main as ppo_main
 import numpy as np
 
 
@@ -36,7 +38,7 @@ class Storage:
     values: jnp.array
 
 
-def parse_args():
+def parse_args_bc():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--exp-name",
@@ -140,9 +142,32 @@ def parse_args():
         default=1,
         help="The frequency with which to evaluate the learned policy",
     )
+    parser.add_argument(
+        "--total-timesteps",
+        type=int,
+        default=10000000,
+        help="The number of timesteps to run for"
+    )
     args = parser.parse_args()
+    args.batch_size = int(args.minatar_num_envs * args.num_steps)
+    args.num_updates = args.total_timesteps // args.batch_size
     args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
-    return args
+    ppo_args = parse_args(prefix="ppo")
+    ppo_args.ppo_return_trained_params = True
+    ppo_args.ppo_minatar_only = True
+    return args, ppo_args
+
+
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+def strip_prefix(args, prefix):
+    ns = argparse.Namespace()
+    for arg, val in vars(args):
+        setattr(ns, remove_prefix(arg, prefix), val)
+    return ns
 
 @flax.struct.dataclass
 class AgentParams:
@@ -153,7 +178,8 @@ class AgentParams:
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args, ppo_args = parse_args_bc()
+    ppo_args = strip_prefix(ppo_args, "ppo")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -305,7 +331,6 @@ if __name__ == "__main__":
         max_steps=args.num_steps,
     )
 
-    # load the parameters
     (
         key,
         minatar_key,
@@ -358,6 +383,18 @@ if __name__ == "__main__":
             ),
         )
 
+    # train the network using PPO
+    ppo_params = ppo_main(ppo_args)
+    ppo_params = AgentParams(
+        minatar_params=ppo_params.minatar_params,
+        body_params=ppo_params.body_params,
+        minatar_actor_params=ppo_params.minatar_actor_params,
+        critic_params=ppo_params.critic_params
+    )
+    # restore the parameters to the BC state (if option set) 
+    # and the restored state (always)
+    # freeze and reinit the BC state (if option set)
+
     bc_state = TrainState.create(
         apply_fn=None,
         params=AgentParams(
@@ -370,19 +407,9 @@ if __name__ == "__main__":
     )
     restored_state = TrainState.create(
         apply_fn=None,
-        params=AgentParams(
-            minatar_params=minatar_params,
-            body_params=body_params,
-            minatar_actor_params=minatar_actor_params,
-            critic_params=critic_params,
-        ),
+        params=ppo_params,
         tx=make_opt(args.learning_rate),
     )
-    params = checkpoints.restore_checkpoint(
-        ckpt_dir=args.params_dir, target=restored_state
-    )
-
-    # freeze and reinitialise appropriately
 
     @jax.jit
     def compute_bc_loss(bc_state: TrainState, storage: Storage):
