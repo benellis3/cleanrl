@@ -70,9 +70,9 @@ def parse_args(parser=None, prefix=None):
     parser.add_argument(fmt_arg("total-transfer-timesteps"), type=int, default=10000000,
         help="total timesteps of the experiments")
     parser.add_argument(fmt_arg("total-minatar-steps"), type=int, default=100000000)
-    parser.add_argument(fmt_arg("--learning-rate"), type=float, default=1e-3,
+    parser.add_argument(fmt_arg("learning-rate"), type=float, default=1e-3,
         help="the learning rate of the optimizer for atari")
-    parser.add_argument(fmt_arg("--transfer-learning-rate"), type=float, default=1e-3,
+    parser.add_argument(fmt_arg("transfer-learning-rate"), type=float, default=1e-3,
         help="The learning rate to use for the transfer environment")
     parser.add_argument(fmt_arg("transfer-num-envs"), type=int, default=8,
         help="the number of parallel game environments")
@@ -117,15 +117,20 @@ def parse_args(parser=None, prefix=None):
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
-            return f"{prefix}_attr"
+            return f"{prefix}_{attr}"
         else:
             return attr
-    setattr(args, fmt_attr("transfer_batch_size"), int(args.transfer_num_envs * args.num_steps))
-    setattr(args, fmt_attr("minatar_batch_size"), int(args.minatar_num_envs * args.num_steps))
-    setattr(args, fmt_attr("minibatch_size"), int(args.transfer_batch_size // args.num_minibatches))
-    setattr(args, fmt_attr("num_updates"), args.total_transfer_timesteps // args.transfer_batch_size)
-    setattr(args, fmt_attr("num_minatar_updates"), args.total_minatar_steps // args.minatar_batch_size)
-    setattr(args, fmt_attr("num_transfer_updates"), args.num_updates)
+    
+    def get_attr(attribute: str):
+        return getattr(args, fmt_attr(attribute))
+
+
+    setattr(args, fmt_attr("transfer_batch_size"), int(get_attr("transfer_num_envs") * get_attr("num_steps")))
+    setattr(args, fmt_attr("minatar_batch_size"), int(get_attr("minatar_num_envs") * get_attr("num_steps")))
+    setattr(args, fmt_attr("minibatch_size"), int(get_attr("transfer_batch_size") // get_attr("num_minibatches")))
+    setattr(args, fmt_attr("num_updates"), get_attr("total_transfer_timesteps") // get_attr("transfer_batch_size"))
+    setattr(args, fmt_attr("num_minatar_updates"), get_attr("total_minatar_steps") // get_attr("minatar_batch_size"))
+    setattr(args, fmt_attr("num_transfer_updates"), get_attr("num_updates"))
     setattr(args, fmt_attr("minatar_env_id"), f"{args.env_id.split('-')[0]}-MinAtar")
     # This argument is only set by the behaviour cloning script.
     # Really not sure how to make the control flow on this make sense. Sorry gang.
@@ -210,7 +215,6 @@ class EnvPoolAutoResetWrapper(GymnaxWrapper):
         )
         return obs, state, reward, done, info
 
-
 class SignedRewardWrapper(GymnaxWrapper):
     def __init__(self, env: environment.Environment):
         super().__init__(env)
@@ -220,7 +224,6 @@ class SignedRewardWrapper(GymnaxWrapper):
         obs, state, reward, done, info = self._env.step_env(key, state, action, params)
         info["reward"] = reward
         return obs, state, jnp.sign(reward), done, info
-
 
 def make_gymnax_env(env_id, num_envs, permute_obs, permutation_key=None):
     def thunk():
@@ -380,9 +383,8 @@ class UpdateStats(NamedTuple):
     loss: jnp.array
 
 
-def log_stats(writer, episode_stats, env_step, global_step, prefix, learning_rate, update_stats):
+def log_stats(writer, args, episode_stats, env_step, global_step, prefix, learning_rate, num_envs, update_stats):
     update_time_start, v_loss, pg_loss, entropy_loss, approx_kl, loss = update_stats
-    num_envs = getattr(args, f"{prefix}_num_envs")
     avg_episodic_return = np.mean(
         jax.device_get(episode_stats.returned_episode_returns)
     )
@@ -454,7 +456,7 @@ def main(args):
         minatar_actor_key,
         atari_actor_key,
         critic_key,
-    ) = jax.random.split(key, 6)
+    ) = jax.random.split(key, 7)
 
     # env setup
     # Define all three environments anyway just to avoid refactoring too much
@@ -992,11 +994,13 @@ def main(args):
                 learning_rate = None
             log_stats(
                 writer=writer,
+                args=args,
                 episode_stats=minatar_episode_stats,
                 env_step=minatar_step,
                 global_step=global_step,
                 prefix="minatar",
                 learning_rate=learning_rate,
+                num_envs=args.minatar_num_envs,
                 update_stats=UpdateStats(
                     update_time_start=update_time_start,
                     v_loss=v_loss,
@@ -1012,7 +1016,7 @@ def main(args):
     # optimiser state gets reset
 
     if args.minatar_only and args.return_trained_params:
-        return agent_state.params
+        return agent_state.params, minatar_encoder, body, minatar_actor
 
     if not args.minatar_only:
         if args.freeze_final_layers_on_transfer:
@@ -1103,11 +1107,13 @@ def main(args):
                 learning_rate = None
             log_stats(
                 writer=writer,
+                args=args,
                 episode_stats=transfer_episode_stats,
                 env_step=transfer_step,
                 global_step=global_step,
                 prefix="transfer",
                 learning_rate=learning_rate,
+                num_envs=args.transfer_num_envs,
                 update_stats=UpdateStats(
                     update_time_start=update_time_start,
                     v_loss=v_loss,

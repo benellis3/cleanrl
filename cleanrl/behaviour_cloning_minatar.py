@@ -33,6 +33,7 @@ class Storage:
     minatar_obs: jnp.array
     transfer_obs: jnp.array
     actions: jnp.array
+    logits: jnp.array
     logprobs: jnp.array
     dones: jnp.array
     values: jnp.array
@@ -121,7 +122,7 @@ def parse_args_bc():
     parser.add_argument(
         "--num-body-layers",
         type=int,
-        default=1,
+        default=2,
         help="The number of layers to have in the body of the network"
     )
     parser.add_argument(
@@ -139,7 +140,7 @@ def parse_args_bc():
     parser.add_argument(
         "--evaluation-frequency",
         type=int,
-        default=1,
+        default=5,
         help="The frequency with which to evaluate the learned policy",
     )
     parser.add_argument(
@@ -148,13 +149,20 @@ def parse_args_bc():
         default=10000000,
         help="The number of timesteps to run for"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--init-with-ppo-params",
+        type=lambda x: bool(strtobool(x)),
+        default=False,
+        help="Whether to initialise with the parameters of the trained network"
+    )
+    args = parse_args(prefix="ppo", parser=parser)
+    
     args.batch_size = int(args.minatar_num_envs * args.num_steps)
     args.num_updates = args.total_timesteps // args.batch_size
     args.minatar_env_id = f"{args.env_id.split('-')[0]}-MinAtar"
-    ppo_args = parse_args(prefix="ppo")
-    ppo_args.ppo_return_trained_params = True
-    ppo_args.ppo_minatar_only = True
+    ppo_args = strip_prefix(args, prefix="ppo_")
+    ppo_args.return_trained_params = True
+    ppo_args.minatar_only = True
     return args, ppo_args
 
 
@@ -165,8 +173,9 @@ def remove_prefix(text, prefix):
 
 def strip_prefix(args, prefix):
     ns = argparse.Namespace()
-    for arg, val in vars(args):
-        setattr(ns, remove_prefix(arg, prefix), val)
+    for arg, val in vars(args).items():
+        if arg.startswith(prefix):
+            setattr(ns, remove_prefix(arg, prefix), val)
     return ns
 
 @flax.struct.dataclass
@@ -179,7 +188,6 @@ class AgentParams:
 
 if __name__ == "__main__":
     args, ppo_args = parse_args_bc()
-    ppo_args = strip_prefix(ppo_args, "ppo")
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -218,8 +226,8 @@ if __name__ == "__main__":
         returned_episode_lengths=jnp.zeros(args.minatar_num_envs, dtype=jnp.int32),
     )
 
-    minatar_encoder = MinAtarEncoder(num_layers=args.num_encoder_layers)
-    body = SharedActorCriticBody(num_layers=args.num_body_layers)
+    minatar_encoder = MinAtarEncoder(num_layers=ppo_args.num_minatar_encoder_layers)
+    body = SharedActorCriticBody(num_layers=ppo_args.num_body_layers)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
     critic = Critic()
 
@@ -241,7 +249,7 @@ if __name__ == "__main__":
         )
         return episode_stats, env_state, (obs, reward, done, info)
 
-    @partial(jax.jit, static_argnums=(3,))
+    @jax.jit
     def get_action_and_value(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -251,22 +259,22 @@ if __name__ == "__main__":
 
         hidden = minatar_encoder.apply(agent_state.params.minatar_params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
-        logits = minatar_actor.apply(agent_state.params.actor_params, hidden)
+        logits = minatar_actor.apply(agent_state.params.minatar_actor_params, hidden)
         # sample action: Gumbel-softmax trick
         # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
         key, subkey = jax.random.split(key)
         u = jax.random.uniform(subkey, shape=logits.shape)
         action = jnp.argmax(logits - jnp.log(-jnp.log(u)), axis=1)
-        logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
+        logprob = jax.nn.log_softmax(logits)# [jnp.arange(action.shape[0]), action]
         value = critic.apply(agent_state.params.critic_params, hidden)
-        return action, logprob, value.squeeze(1), key
+        return action, logprob, logits, value.squeeze(1), key
 
-    def step_once(carry, step, minatar_env_step_fn, permute_fn=None, permute_obs=False):
+    def step_once(carry, unused_inp, env_step_fn, permute_fn=None, permute_obs=False):
         agent_state, episode_stats, obs, done, key, handle = carry
-        action, logprob, value, key = get_action_and_value(agent_state, obs, key)
+        action, logprob, logits, value, key = get_action_and_value(agent_state, obs, key)
 
         key, env_key = jax.random.split(key)
-        episode_stats, handle, (next_obs, _, next_done, _) = minatar_env_step_fn(
+        episode_stats, handle, (next_obs, _, next_done, _) = env_step_fn(
             episode_stats, env_key, handle, action
         )
         # take same action in transfer environment
@@ -274,6 +282,7 @@ if __name__ == "__main__":
             minatar_obs=obs,
             transfer_obs=permute_fn(obs) if permute_obs else jnp.zeros_like(obs),
             actions=action,
+            logits=logits,
             logprobs=logprob,
             dones=done,
             values=value,
@@ -312,7 +321,7 @@ if __name__ == "__main__":
             env_step_fn=partial(
                 minatar_step_env_wrapped, minatar_step_env_fn=minatar_step_env
             ),
-            permute_fn=minatar_envs.permute_obs,
+            permute_fn=permuted_minatar_envs.permute_obs,
             permute_obs=True,
         ),
         max_steps=args.num_steps,
@@ -384,45 +393,85 @@ if __name__ == "__main__":
         )
 
     # train the network using PPO
-    ppo_params = ppo_main(ppo_args)
-    ppo_params = AgentParams(
+    ppo_params, ppo_encoder, ppo_body, ppo_actor = ppo_main(ppo_args)
+    ppo_params_restore = AgentParams(
         minatar_params=ppo_params.minatar_params,
         body_params=ppo_params.body_params,
         minatar_actor_params=ppo_params.minatar_actor_params,
         critic_params=ppo_params.critic_params
     )
-    # restore the parameters to the BC state (if option set) 
-    # and the restored state (always)
-    # freeze and reinit the BC state (if option set)
-
-    bc_state = TrainState.create(
-        apply_fn=None,
-        params=AgentParams(
+    # restore the parameters to the BC state (if option set)
+    if args.init_with_ppo_params and not args.reinitiliase_encoder:
+        bc_params = AgentParams(
+            minatar_params=ppo_params.minatar_params,
+            body_params=ppo_params.body_params,
+            minatar_actor_params=ppo_params.minatar_actor_params,
+            critic_params=ppo_params.critic_params,
+        )
+    elif args.init_with_ppo_params and args.reinitialise_encoder:
+        bc_params = AgentParams(
+            minatar_params=minatar_params,
+            body_params=ppo_params.body_params,
+            minatar_actor_params=ppo_params.minatar_actor_params,
+            critic_params=ppo_params.critic_params
+        )
+    else:
+        bc_params = AgentParams(
             minatar_params=minatar_params,
             body_params=body_params,
             minatar_actor_params=minatar_actor_params,
             critic_params=critic_params,
-        ),
-        tx=make_opt(args.learning_rate),
+        )
+
+    if args.freeze_final_layers_on_transfer:
+        opt = optax.multi_transform(
+                {
+                    "encoder": make_opt(
+                        use_proxy=False, learning_rate=args.learning_rate
+                    ),
+                    "rest": optax.set_to_zero(),
+                },
+                param_labels=AgentParams(
+                    minatar_params="encoder",
+                    body_params="rest",
+                    minatar_actor_params="rest",
+                    critic_params="rest",
+                ),
+            )
+    else:
+        opt = make_opt(args.learning_rate)
+
+    bc_state = TrainState.create(
+        apply_fn=None,
+        params=bc_params,
+        tx=opt,
     )
     restored_state = TrainState.create(
         apply_fn=None,
-        params=ppo_params,
-        tx=make_opt(args.learning_rate),
+        params=ppo_params_restore,
+        tx=optax.set_to_zero(),
     )
+    random_obs = np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+    ppo_x = ppo_encoder.apply(ppo_params.minatar_params, random_obs)
+    ppo_x = ppo_body.apply(ppo_params.body_params, ppo_x)
+    ppo_logits = ppo_actor.apply(ppo_params.minatar_actor_params, ppo_x)
+    bc_x = minatar_encoder.apply(restored_state.params.minatar_params, random_obs)
+    bc_x = body.apply(restored_state.params.body_params, bc_x)
+    bc_logits = minatar_actor.apply(restored_state.params.minatar_actor_params, bc_x)
+    assert jnp.allclose(bc_logits, ppo_logits)
 
     @jax.jit
-    def compute_bc_loss(bc_state: TrainState, storage: Storage):
+    def compute_bc_loss(params: AgentParams, storage: Storage):
         # compute the logits
-        x = minatar_encoder.apply(bc_state.params.minatar_params, storage.transfer_obs)
-        x = body.apply(bc_state.params.body_params, x)
-        action_logits = body.apply(bc_state.params.actor_params, x)
+        x = minatar_encoder.apply(params.minatar_params, storage.transfer_obs)
+        x = body.apply(params.body_params, x)
+        action_logits = minatar_actor.apply(params.minatar_actor_params, x)
+        action_logits = jax.nn.log_softmax(action_logits)
         loss = (
             jnp.exp(storage.logprobs)
-            * (jnp.where(storage.logprobs == 0.0, 0, storage.logprobs))
-            - action_logits
+            * (storage.logprobs - action_logits)
         )
-        return jnp.sum(loss, axis=-1)
+        return jnp.mean(jnp.sum(loss, axis=-1))
 
     bc_loss_grad_fn = jax.value_and_grad(compute_bc_loss)
 
@@ -446,7 +495,7 @@ if __name__ == "__main__":
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
 
             def update_bc_state_minibatch(bc_state: TrainState, storage: Storage):
-                loss, grads = bc_loss_grad_fn(bc_state, storage)
+                loss, grads = bc_loss_grad_fn(bc_state.params, storage)
                 bc_state = bc_state.apply_gradients(grads=grads)
                 return bc_state, (loss, grads)
 
@@ -493,6 +542,7 @@ if __name__ == "__main__":
             key,
             env_state,
         )
+        
         global_step += args.num_steps * args.minatar_num_envs
         bc_state, loss, grads, key = update_bc_state(bc_state, minatar_storage, key)
 
@@ -500,6 +550,8 @@ if __name__ == "__main__":
         avg_episodic_return = np.mean(
             jax.device_get(minatar_episode_stats.returned_episode_returns)
         )
+
+        print(f"loss: {loss[-1, -1].item()}, avg_return: {avg_episodic_return}")
         writer.add_scalar(
             "charts/demo_policy_avg_episode_return", avg_episodic_return, global_step
         )
@@ -527,3 +579,5 @@ if __name__ == "__main__":
             writer.add_scalar(
                 "charts/bc_policy_avg_episode_return", avg_episodic_return, global_step
             )
+            print(f"global_step: {global_step}, bc_policy_avg_episodic_return: {avg_episodic_return}")
+
