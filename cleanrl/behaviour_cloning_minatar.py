@@ -189,6 +189,18 @@ class AgentParams:
 if __name__ == "__main__":
     args, ppo_args = parse_args_bc()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    if args.track:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -230,6 +242,11 @@ if __name__ == "__main__":
     body = SharedActorCriticBody(num_layers=ppo_args.num_body_layers)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
     critic = Critic()
+
+    minatar_encoder.apply = jax.jit(minatar_encoder.apply)
+    body.apply = jax.jit(body.apply)
+    minatar_actor.apply = jax.jit(minatar_actor.apply)
+    critic.apply = jax.jit(critic.apply)
 
     def minatar_step_env_wrapped(
         episode_stats, key, env_state, action, minatar_step_env_fn
@@ -401,7 +418,7 @@ if __name__ == "__main__":
         critic_params=ppo_params.critic_params
     )
     # restore the parameters to the BC state (if option set)
-    if args.init_with_ppo_params and not args.reinitiliase_encoder:
+    if args.init_with_ppo_params and not args.reinitialise_encoder:
         bc_params = AgentParams(
             minatar_params=ppo_params.minatar_params,
             body_params=ppo_params.body_params,
@@ -423,12 +440,11 @@ if __name__ == "__main__":
             critic_params=critic_params,
         )
 
+
     if args.freeze_final_layers_on_transfer:
         opt = optax.multi_transform(
                 {
-                    "encoder": make_opt(
-                        use_proxy=False, learning_rate=args.learning_rate
-                    ),
+                    "encoder": make_opt(learning_rate=args.learning_rate),
                     "rest": optax.set_to_zero(),
                 },
                 param_labels=AgentParams(
