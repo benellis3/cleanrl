@@ -419,8 +419,9 @@ if __name__ == "__main__":
     )
 
     def schedule(count, learning_rate, alpha=0.0, exponent=1.0):
-        decay_steps = jnp.minimum(
-            count, int(args.cos_decay_fraction * args.num_updates)
+        decay_steps = int(args.cos_decay_fraction * args.num_updates)
+        count = jnp.minimum(
+            count, decay_steps
         )
         cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * count / decay_steps))
         decayed = (1 - alpha) * cosine_decay**exponent + alpha
@@ -601,16 +602,16 @@ if __name__ == "__main__":
         writer.add_scalar(
             "charts/demo_policy_avg_episode_return", avg_episodic_return, global_step
         )
-        writer.add_scalar("charts/bc_obs_enc_mean", jnp.mean(obs_enc), global_step)
-        writer.add_scalar("charts/bc_obs_enc_std", jnp.std(obs_enc), global_step)
+        writer.add_scalar("charts/bc_obs_enc_mean", np.mean(jax.device_get(obs_enc)).item(), global_step)
+        writer.add_scalar("charts/bc_obs_enc_std", np.std(jax.device_get(obs_enc)).item(), global_step)
         writer.add_scalar(
             "charts/expert_obs_enc_mean",
-            jnp.std(minatar_storage.hidden_enc),
+            np.mean(jax.device_get(minatar_storage.hidden_enc)).item(),
             global_step,
         )
         writer.add_scalar(
             "charts/expert_obs_enc_std",
-            jnp.std(minatar_storage.hidden_enc),
+            np.std(jax.device_get(minatar_storage.hidden_enc)).item(),
             global_step,
         )
 
