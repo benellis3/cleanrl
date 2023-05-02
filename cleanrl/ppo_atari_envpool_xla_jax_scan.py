@@ -1176,6 +1176,7 @@ def main(args):
                     minatar_params="encoder",
                     body_params="rest",
                     minatar_actor_params="rest",
+                    atari_clip_params="encoder",
                     atari_actor_params="encoder",
                     critic_params="rest",
                 ),
@@ -1196,6 +1197,7 @@ def main(args):
                 body_params=agent_state.params.body_params,
                 atari_actor_params=agent_state.params.atari_actor_params,
                 minatar_actor_params=agent_state.params.minatar_actor_params,
+                atari_clip_params=agent_state.params.atari_clip_params,
                 critic_params=agent_state.params.critic_params,
             )
         else:
