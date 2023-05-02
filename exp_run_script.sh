@@ -1,6 +1,6 @@
 #!/bin/bash
 # debug=
-# debug=echo
+debug=echo
 trap 'onCtrlC' INT
 
 function onCtrlC () {
@@ -14,7 +14,7 @@ function onCtrlC () {
 }
 
 env_ids=${1:-Asterix-v5,Breakout-v5,SpaceInvaders-v5,Freeway-v5}
-lrs=${2:-0.01,0.1,0.001,0.0001}
+lrs=${2:-0.0002}
 args=${3:-}
 gpus=${3:-0,1,2,3,4,5,6,7}
 threads=${4:-16}
@@ -39,19 +39,9 @@ for lr in "${lrs[@]}"; do
         for((i=0;i<times;i++)); do
             gpu=${gpus[$(($count % ${#gpus[@]}))]}  
             group="${config}-${tag}"
-            ./run.sh $gpu $env   --transfer-environment minatar \
-            --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr &
-            count=$(($count + 1))     
-            if [ $(($count % $threads)) -eq 0 ]; then
-                wait
-            fi
-            # for random seeds
-            sleep $((RANDOM % 3 + 3))
-            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
-            ./run.sh $gpu $env   --transfer-environment minatar \
-            --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True &
+            $debug ./run.sh $gpu $env   --transfer-environment atari \
+            --total-minatar-steps 100000000 --transfer-num-envs 8 \
+            --seed $i --transfer-learning-rate $lr --use-clip-encoder True &
             count=$(($count + 1))     
             if [ $(($count % $threads)) -eq 0 ]; then
                 wait
@@ -60,9 +50,22 @@ for lr in "${lrs[@]}"; do
             sleep $((RANDOM % 3 + 3))
 
             gpu=${gpus[$(($count % ${#gpus[@]}))]}  
-            ./run.sh $gpu $env   --transfer-environment minatar \
-            --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True --reinitialise-encoder True &
+            $debug ./run.sh $gpu $env   --transfer-environment atari \
+            --total-minatar-steps 100000000 --transfer-num-envs 8 \
+            --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True --use-clip-encoder True &
+            count=$(($count + 1))     
+            if [ $(($count % $threads)) -eq 0 ]; then
+                wait
+            fi
+            # for random seeds
+            sleep $((RANDOM % 3 + 3))
+
+
+            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
+            $debug ./run.sh $gpu $env   --transfer-environment atari \
+            --total-minatar-steps 100000000 --transfer-num-envs 8 \
+            --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True --reinitialise-encoder True \
+            --use-clip-encoder True &
             count=$(($count + 1))     
             if [ $(($count % $threads)) -eq 0 ]; then
                 wait
@@ -71,9 +74,9 @@ for lr in "${lrs[@]}"; do
             sleep $((RANDOM % 3 + 3))
 
             gpu=${gpus[$(($count % ${#gpus[@]}))]}  
-            ./run.sh $gpu $env   --transfer-environment minatar \
-            --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr --reinitialise-encoder True &
+            $debug ./run.sh $gpu $env   --transfer-environment atari \
+            --total-minatar-steps 100000000 --transfer-num-envs 8 \
+            --seed $i --transfer-learning-rate $lr --reinitialise-encoder True --use-clip-encoder True &
             count=$(($count + 1))     
             if [ $(($count % $threads)) -eq 0 ]; then
                 wait
@@ -82,9 +85,9 @@ for lr in "${lrs[@]}"; do
             sleep $((RANDOM % 3 + 3))
 
             gpu=${gpus[$(($count % ${#gpus[@]}))]}  
-            ./run.sh $gpu $env   --transfer-environment minatar \
-            --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr --transfer-only True &
+            $debug ./run.sh $gpu $env   --transfer-environment atari \
+            --total-minatar-steps 100000000 --transfer-num-envs 8 \
+            --seed $i --transfer-learning-rate $lr --transfer-only True --use-clip-encoder True &
             count=$(($count + 1))     
             if [ $(($count % $threads)) -eq 0 ]; then
                 wait
