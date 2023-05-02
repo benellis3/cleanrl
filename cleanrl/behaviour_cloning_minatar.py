@@ -165,7 +165,7 @@ def parse_args_bc():
     parser.add_argument(
         "--cos-decay-fraction",
         type=float,
-        default=0.3,
+        default=1.0,
         help="The fraction of the steps to decay the learning rate over",
     )
     args = parse_args(prefix="ppo", parser=parser)
