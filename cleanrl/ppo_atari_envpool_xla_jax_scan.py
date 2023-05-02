@@ -167,7 +167,7 @@ class PermuteObservationGymnaxWrapper(GymnaxWrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def reset_env(self, key, params):
-        obs, state = self._env.reset(key, params)
+        obs, state = self._env.reset_env(key, params)
         return self.permute_obs(obs), state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -309,6 +309,7 @@ class SharedActorCriticBody(nn.Module):
             x = nn.Dense(
                 512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
+            x = nn.LayerNorm()(x)
             x = nn.relu(x)
         return x
 
