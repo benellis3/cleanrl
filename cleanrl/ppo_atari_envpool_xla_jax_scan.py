@@ -114,6 +114,7 @@ def parse_args(parser=None, prefix=None):
         help="The number of layers to put in the MinAtar Encoder")
     parser.add_argument(fmt_arg("num-body-layers"), type=int, default=2,
         help="The number of layers to put in the shared body between the actor and critic")
+    parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
@@ -309,14 +310,13 @@ class SharedActorCriticBody(nn.Module):
             x = nn.Dense(
                 512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
-            x = nn.LayerNorm()(x)
             x = nn.relu(x)
         return x
 
 
 class MinAtarEncoder(nn.Module):
     num_layers: int
-
+    use_layer_norm: bool
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
@@ -324,6 +324,8 @@ class MinAtarEncoder(nn.Module):
             x = nn.Dense(
                 512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
             x = nn.relu(x)
 
         return x
@@ -564,7 +566,7 @@ def main(args):
         )
 
     atari_encoder = AtariEncoder()
-    minatar_encoder = MinAtarEncoder(args.num_minatar_encoder_layers)
+    minatar_encoder = MinAtarEncoder(args.num_minatar_encoder_layers, args.use_layer_norm)
     body = SharedActorCriticBody(args.num_body_layers)
     atari_actor = Actor(action_dim=envs.single_action_space.n)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
