@@ -216,6 +216,7 @@ class EnvPoolAutoResetWrapper(GymnaxWrapper):
         )
         return obs, state, reward, done, info
 
+
 class SignedRewardWrapper(GymnaxWrapper):
     def __init__(self, env: environment.Environment):
         super().__init__(env)
@@ -225,6 +226,7 @@ class SignedRewardWrapper(GymnaxWrapper):
         obs, state, reward, done, info = self._env.step_env(key, state, action, params)
         info["reward"] = reward
         return obs, state, jnp.sign(reward), done, info
+
 
 def make_gymnax_env(env_id, num_envs, permute_obs, permutation_key=None):
     def thunk():
@@ -317,6 +319,7 @@ class SharedActorCriticBody(nn.Module):
 class MinAtarEncoder(nn.Module):
     num_layers: int
     use_layer_norm: bool
+
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
@@ -386,7 +389,17 @@ class UpdateStats(NamedTuple):
     loss: jnp.array
 
 
-def log_stats(writer, args, episode_stats, env_step, global_step, prefix, learning_rate, num_envs, update_stats):
+def log_stats(
+    writer,
+    args,
+    episode_stats,
+    env_step,
+    global_step,
+    prefix,
+    learning_rate,
+    num_envs,
+    update_stats,
+):
     update_time_start, v_loss, pg_loss, entropy_loss, approx_kl, loss = update_stats
     avg_episodic_return = np.mean(
         jax.device_get(episode_stats.returned_episode_returns)
@@ -566,7 +579,9 @@ def main(args):
         )
 
     atari_encoder = AtariEncoder()
-    minatar_encoder = MinAtarEncoder(args.num_minatar_encoder_layers, args.use_layer_norm)
+    minatar_encoder = MinAtarEncoder(
+        args.num_minatar_encoder_layers, args.use_layer_norm
+    )
     body = SharedActorCriticBody(args.num_body_layers)
     atari_actor = Actor(action_dim=envs.single_action_space.n)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
@@ -728,10 +743,9 @@ def main(args):
             else agent_state.params.minatar_params
         )
         num_envs = args.transfer_num_envs if not use_proxy else args.minatar_num_envs
-        next_value = critic.apply(
-            agent_state.params.critic_params,
-            encoder.apply(encoder_params, next_obs),
-        ).squeeze()
+        hidden = (encoder.apply(encoder_params, next_obs),)
+        hidden = body.apply(agent_state.params.body_params, hidden)
+        next_value = critic.apply(agent_state.params.critic_params, hidden).squeeze()
 
         advantages = jnp.zeros((num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
@@ -992,7 +1006,11 @@ def main(args):
                 key,
             ) = update_ppo(agent_state, storage, key, True)
             if not args.freeze_final_layers_on_transfer:
-                learning_rate = getattr(agent_state, "opt_state")[1].hyperparams["learning_rate"].item()
+                learning_rate = (
+                    getattr(agent_state, "opt_state")[1]
+                    .hyperparams["learning_rate"]
+                    .item()
+                )
             else:
                 learning_rate = None
             log_stats(
@@ -1105,7 +1123,11 @@ def main(args):
                 key,
             ) = update_ppo(agent_state, storage, key, use_minatar)
             if not args.freeze_final_layers_on_transfer:
-                learning_rate = getattr(agent_state, "opt_state")[1].hyperparams["learning_rate"].item()
+                learning_rate = (
+                    getattr(agent_state, "opt_state")[1]
+                    .hyperparams["learning_rate"]
+                    .item()
+                )
             else:
                 learning_rate = None
             log_stats(
