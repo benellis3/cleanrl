@@ -26,7 +26,10 @@ from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 from flax import core
 from flax import struct
+import seaborn as sns
+from matplotlib import colors
 from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoProcessor, FlaxCLIPModel
 
 
 def parse_args(parser=None, prefix=None):
@@ -115,6 +118,9 @@ def parse_args(parser=None, prefix=None):
     parser.add_argument(fmt_arg("num-body-layers"), type=int, default=2,
         help="The number of layers to put in the shared body between the actor and critic")
     parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
+    parser.add_argument(fmt_arg("use-clip-encoder"), type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument(fmt_arg("clip-model-str"), type=str, default="openai/clip-vit-large-patch14", help="The clip model to use")
+    parser.add_argument(fmt_arg("atari-clip-encoder-num-layers"), type=int, default=1, help="The default number of layers in the new layers between CLIP and Atari")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
@@ -149,6 +155,44 @@ class GymnaxWrapper(object):
     # provide proxy access to regular attributes of wrapped object
     def __getattr__(self, name):
         return getattr(self._env, name)
+
+
+class ImageMinAtarWrapper(GymnaxWrapper):
+    """Class for rendering MinAtar as a pixel
+    environment. This is so that it can be
+    used with CLIP"""
+
+    def __init__(self, env: environment.Environment, return_true_image=False):
+        super().__init__(env)
+        self.return_true_image = return_true_image
+
+    @partial(jax.jit, static_argnums=(0,))
+    def obs_as_image(self, obs):
+        img = (
+            jnp.amax(obs * jnp.reshape(jnp.arange(obs.shape[-1]) + 1, (1, 1, -1)), 2)
+            + 0.5
+        )
+        if self.return_true_image:
+            img = jnp.uint8(self.cmap(self.norm(img)) * 255)
+            img = img[:, :, :3]  # ignore the A dimension, just RGB
+        return img
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset_env(self, key, params):
+        obs, state = self._env.reset_env(key, params)
+        if not hasattr(self, "n_channels"):
+            self.n_channels = obs.shape[-1]
+            self.cmap = sns.color_palette("cubehelix", self.n_channels)
+            self.cmap.insert(0, (0, 0, 0))
+            self.cmap = colors.ListedColormap(self.cmap)
+            bounds = range(self.n_channels + 2)
+            self.norm = colors.BoundaryNorm(bounds, self.n_channels + 1)
+        return self.obs_as_image(obs), state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step_env(self, key, state, action, params):
+        obs, state, reward, done, info = self._env.step_env(key, state, action, params)
+        return self.obs_as_image(obs), state, reward, done, info
 
 
 class PermuteObservationGymnaxWrapper(GymnaxWrapper):
@@ -228,11 +272,13 @@ class SignedRewardWrapper(GymnaxWrapper):
         return obs, state, jnp.sign(reward), done, info
 
 
-def make_gymnax_env(env_id, num_envs, permute_obs, permutation_key=None):
+def make_gymnax_env(env_id, num_envs, permute_obs, image_obs, permutation_key=None):
     def thunk():
         env, env_params = gymnax.make(env_id)
         if permute_obs:
             env = PermuteObservationGymnaxWrapper(env, permutation_key=permutation_key)
+        if image_obs:
+            env = ImageMinAtarWrapper(env, return_true_image=True)
         return (
             VectorizedGymnaxWrapper(
                 EnvPoolAutoResetWrapper(SignedRewardWrapper(env)),
@@ -316,6 +362,31 @@ class SharedActorCriticBody(nn.Module):
         return x
 
 
+class CLIPModel:
+    """Simple class that combines the image processing and model calling of clip"""
+
+    def __init__(self, model_str: str):
+        self.processor = AutoProcessor.from_pretrained(model_str)
+        self.model = FlaxCLIPModel.from_pretrained(model_str)
+
+    def __call__(self, images):
+        inputs = self.processor(images=images, return_tensors="np")
+        return self.model.get_image_features(**inputs)
+
+
+class AtariCLIPEncoder(nn.Module):
+    num_layers: int
+
+    @nn.compact
+    def __call__(self, x):
+        for _ in range(self.num_layers):
+            x = nn.Dense(
+                512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            )(x)
+            x = nn.relu(x)
+        return x
+
+
 class MinAtarEncoder(nn.Module):
     num_layers: int
     use_layer_norm: bool
@@ -357,6 +428,7 @@ class AgentParams:
     body_params: flax.core.FrozenDict
     minatar_actor_params: flax.core.FrozenDict
     atari_actor_params: flax.core.FrozenDict
+    atari_clip_params: flax.core.FrozenDict  # the params to adapt CLIP to Atari
     critic_params: flax.core.FrozenDict
 
 
@@ -471,8 +543,9 @@ def main(args):
         body_key,
         minatar_actor_key,
         atari_actor_key,
+        atari_clip_key,
         critic_key,
-    ) = jax.random.split(key, 7)
+    ) = jax.random.split(key, 8)
 
     # env setup
     # Define all three environments anyway just to avoid refactoring too much
@@ -483,6 +556,7 @@ def main(args):
         args.minatar_env_id,
         args.transfer_num_envs,
         permute_obs=True,
+        image_obs=args.use_clip_encoder,
         permutation_key=permutation_key,
     )()
     permuted_minatar_step_env = partial(
@@ -490,7 +564,10 @@ def main(args):
     )
 
     minatar_envs, env_params = make_gymnax_env(
-        args.minatar_env_id, args.minatar_num_envs, permute_obs=False
+        args.minatar_env_id,
+        args.minatar_num_envs,
+        permute_obs=False,
+        image_obs=args.use_clip_encoder,
     )()
     minatar_step_env = partial(minatar_envs.step, params=env_params)
 
@@ -585,6 +662,8 @@ def main(args):
     body = SharedActorCriticBody(args.num_body_layers)
     atari_actor = Actor(action_dim=envs.single_action_space.n)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
+    clip_encoder = CLIPModel(args.clip_model_str)
+    atari_clip_encoder = AtariCLIPEncoder(args.atari_clip_encoder_num_layers)
     critic = Critic()
     key, init_key = jax.random.split(key)
     atari_params = atari_encoder.init(
@@ -594,7 +673,6 @@ def main(args):
         minatar_key,
         np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
     )
-
     body_params = body.init(
         body_key,
         atari_encoder.apply(
@@ -610,6 +688,9 @@ def main(args):
                 np.array([envs.single_observation_space.sample()]),
             ),
         ),
+    )
+    atari_clip_params = atari_clip_encoder.init(
+        atari_clip_key, clip_encoder(np.array([envs.single_observation_space.sample()]))
     )
     minatar_actor_params = minatar_actor.init(
         minatar_actor_key,
@@ -640,6 +721,7 @@ def main(args):
             body_params=body_params,
             minatar_actor_params=minatar_actor_params,
             atari_actor_params=atari_actor_params,
+            atari_clip_params=atari_clip_params,
             critic_params=critic_params,
         ),
         tx=make_opt(use_proxy=True, learning_rate=args.learning_rate),
@@ -649,6 +731,7 @@ def main(args):
     body.apply = jax.jit(body.apply)
     minatar_actor.apply = jax.jit(minatar_actor.apply)
     atari_actor.apply = jax.jit(atari_actor.apply)
+    atari_clip_encoder.apply = jax.jit(atari_clip_encoder.apply)
     critic.apply = jax.jit(critic.apply)
 
     @partial(jax.jit, static_argnums=(3,))
@@ -657,21 +740,30 @@ def main(args):
         next_obs: np.ndarray,
         key: jax.random.PRNGKey,
         use_minatar: bool,
+        use_clip: bool,
     ):
         """sample action, calculate value, logprob, entropy, and update storage"""
-        encoder = atari_encoder if not use_minatar else minatar_encoder
+        if not use_clip:
+            encoder = atari_encoder if not use_minatar else minatar_encoder
+            encoder_params = (
+                agent_state.params.atari_params
+                if not use_minatar
+                else agent_state.params.minatar_params
+            )
+            hidden = encoder.apply(encoder_params, next_obs)
+        else:
+            hidden = clip_encoder(next_obs)
+            if not use_minatar:
+                hidden = atari_clip_encoder.apply(
+                    agent_state.params.atari_clip_params, hidden
+                )
         actor = atari_actor if not use_minatar else minatar_actor
-        encoder_params = (
-            agent_state.params.atari_params
-            if not use_minatar
-            else agent_state.params.minatar_params
-        )
+
         actor_params = (
             agent_state.params.atari_actor_params
             if not use_minatar
             else agent_state.params.minatar_actor_params
         )
-        hidden = encoder.apply(encoder_params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
         logits = actor.apply(actor_params, hidden)
         # sample action: Gumbel-softmax trick
@@ -689,12 +781,19 @@ def main(args):
         x: np.ndarray,
         action: np.ndarray,
         use_minatar: bool,
+        use_clip: bool,
     ):
         """calculate value, logprob of supplied `action`, and entropy"""
-        encoder = atari_encoder if not use_minatar else minatar_encoder
-        encoder_params = (
-            params.atari_params if not use_minatar else params.minatar_params
-        )
+        if not use_clip:
+            encoder = atari_encoder if not use_minatar else minatar_encoder
+            encoder_params = (
+                params.atari_params if not use_minatar else params.minatar_params
+            )
+            hidden = encoder.apply(encoder_params, x)
+        else:
+            hidden = clip_encoder(x)
+            if not use_minatar:
+                hidden = atari_clip_encoder.apply(params.atari_clip_params, x)
         actor = atari_actor if not use_minatar else minatar_actor
         actor_params = (
             params.atari_actor_params
@@ -702,7 +801,6 @@ def main(args):
             else params.minatar_actor_params
         )
 
-        hidden = encoder.apply(encoder_params, x)
         hidden = body.apply(params.body_params, hidden)
         logits = actor.apply(actor_params, hidden)
         logprob = jax.nn.log_softmax(logits)[jnp.arange(action.shape[0]), action]
@@ -734,18 +832,29 @@ def main(args):
         next_done: np.ndarray,
         storage: Storage,
         use_minatar: bool,
+        use_clip: bool,
         use_proxy: bool,
     ):
-        encoder = atari_encoder if not use_minatar else minatar_encoder
-        encoder_params = (
-            agent_state.params.atari_params
-            if not use_minatar
-            else agent_state.params.minatar_params
-        )
+        if not use_clip:
+            encoder = atari_encoder if not use_minatar else minatar_encoder
+            encoder_params = (
+                agent_state.params.atari_params
+                if not use_minatar
+                else agent_state.params.minatar_params
+            )
+            hidden = encoder.apply(encoder_params, next_obs)
+        else:
+            hidden = clip_encoder(next_obs)
+            if not use_minatar:
+                hidden = atari_clip_encoder.apply(
+                    agent_state.params.atari_clip_params, hidden
+                )
+
         num_envs = args.transfer_num_envs if not use_proxy else args.minatar_num_envs
-        hidden = (encoder.apply(encoder_params, next_obs),)
-        hidden = body.apply(agent_state.params.body_params, hidden)
-        next_value = critic.apply(agent_state.params.critic_params, hidden).squeeze()
+        next_value = critic.apply(
+            agent_state.params.critic_params,
+            body.apply(agent_state.params.body_params, hidden),
+        ).squeeze()
 
         advantages = jnp.zeros((num_envs,))
         dones = jnp.concatenate([storage.dones, next_done[None, :]], axis=0)
@@ -762,8 +871,10 @@ def main(args):
         )
         return storage
 
-    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, use_minatar):
-        newlogprob, entropy, newvalue = get_action_and_value2(params, x, a, use_minatar)
+    def ppo_loss(params, x, a, logp, mb_advantages, mb_returns, use_minatar, use_clip):
+        newlogprob, entropy, newvalue = get_action_and_value2(
+            params, x, a, use_minatar, use_clip
+        )
         logratio = newlogprob - logp
         ratio = jnp.exp(logratio)
         approx_kl = ((ratio - 1) - logratio).mean()
@@ -795,6 +906,7 @@ def main(args):
         storage: Storage,
         key: jax.random.PRNGKey,
         use_minatar: bool,
+        use_clip: bool,
     ):
         def update_epoch(carry, unused_inp):
             agent_state, key = carry
@@ -812,7 +924,7 @@ def main(args):
             flatten_storage = jax.tree_map(flatten, storage)
             shuffled_storage = jax.tree_map(convert_data, flatten_storage)
 
-            def update_minibatch(agent_state, minibatch, use_minatar):
+            def update_minibatch(agent_state, minibatch, use_minatar, use_clip):
                 (
                     loss,
                     (pg_loss, v_loss, entropy_loss, approx_kl),
@@ -824,6 +936,7 @@ def main(args):
                     minibatch.advantages,
                     minibatch.returns,
                     use_minatar,
+                    use_clip,
                 )
                 agent_state = agent_state.apply_gradients(grads=grads)
                 return agent_state, (
@@ -835,7 +948,9 @@ def main(args):
                     grads,
                 )
 
-            update_minibatch_fn = partial(update_minibatch, use_minatar=use_minatar)
+            update_minibatch_fn = partial(
+                update_minibatch, use_minatar=use_minatar, use_clip=use_clip
+            )
             agent_state, (
                 loss,
                 pg_loss,
@@ -881,10 +996,10 @@ def main(args):
     minatar_next_done = jnp.zeros(args.minatar_num_envs, dtype=jax.numpy.bool_)
 
     # based on https://github.dev/google/evojax/blob/0625d875262011d8e1b6aa32566b236f44b4da66/evojax/sim_mgr.py
-    def step_once(carry, step, env_step_fn, use_minatar):
+    def step_once(carry, step, env_step_fn, use_minatar, use_clip):
         agent_state, episode_stats, obs, done, key, handle = carry
         action, logprob, value, key = get_action_and_value(
-            agent_state, obs, key, use_minatar=use_minatar
+            agent_state, obs, key, use_minatar=use_minatar, use_clip=use_clip
         )
 
         key, env_key = jax.random.split(key)
@@ -932,7 +1047,10 @@ def main(args):
         rollout_transfer = partial(
             rollout,
             step_once_fn=partial(
-                step_once, env_step_fn=step_env_wrappeed, use_minatar=False
+                step_once,
+                env_step_fn=step_env_wrappeed,
+                use_minatar=False,
+                use_clip=args.use_clip_encoder,
             ),
             max_steps=args.num_steps,
         )
@@ -946,6 +1064,7 @@ def main(args):
                     minatar_step_env_fn=permuted_minatar_step_env,
                 ),
                 use_minatar=True,
+                use_clip=args.use_clip_encoder,
             ),
             max_steps=args.num_steps,
         )
@@ -958,6 +1077,7 @@ def main(args):
                 minatar_step_env_wrapped, minatar_step_env_fn=minatar_step_env
             ),
             use_minatar=True,
+            use_clip=args.use_clip_encoder,
         ),
         max_steps=args.num_steps,
     )
@@ -994,6 +1114,7 @@ def main(args):
                 next_done,
                 storage,
                 use_minatar=True,
+                use_clip=args.use_clip_encoder,
                 use_proxy=True,
             )
             (
@@ -1004,7 +1125,9 @@ def main(args):
                 entropy_loss,
                 approx_kl,
                 key,
-            ) = update_ppo(agent_state, storage, key, True)
+            ) = update_ppo(
+                agent_state, storage, key, True, use_clip=args.use_clip_encoder
+            )
             if not args.freeze_final_layers_on_transfer:
                 learning_rate = (
                     getattr(agent_state, "opt_state")[1]
@@ -1111,6 +1234,7 @@ def main(args):
                 next_done,
                 storage,
                 use_minatar=use_minatar,
+                use_clip=args.use_clip_encoder,
                 use_proxy=False,
             )
             (
@@ -1121,7 +1245,9 @@ def main(args):
                 entropy_loss,
                 approx_kl,
                 key,
-            ) = update_ppo(agent_state, storage, key, use_minatar)
+            ) = update_ppo(
+                agent_state, storage, key, use_minatar, use_clip=args.use_clip_encoder
+            )
             if not args.freeze_final_layers_on_transfer:
                 learning_rate = (
                     getattr(agent_state, "opt_state")[1]
