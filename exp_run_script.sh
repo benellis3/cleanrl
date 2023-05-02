@@ -16,7 +16,7 @@ function onCtrlC () {
 env_ids=${1:-Asterix-v5,Breakout-v5,SpaceInvaders-v5,Freeway-v5}
 lrs=${2:-0.01,0.1,0.001,0.0001}
 args=${3:-}
-gpus=${3:0,1,2,3,4,5,6,7}
+gpus=${3:-0,1,2,3,4,5,6,7}
 threads=${4:-16}
 times=${5:-5}
 
@@ -48,6 +48,7 @@ for lr in "${lrs[@]}"; do
             fi
             # for random seeds
             sleep $((RANDOM % 3 + 3))
+            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
             ./run.sh $gpu $env   --transfer-environment minatar \
             --total-minatar-steps 10000000 --transfer-num-envs 128 \
             --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True &
@@ -57,6 +58,8 @@ for lr in "${lrs[@]}"; do
             fi
             # for random seeds
             sleep $((RANDOM % 3 + 3))
+
+            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
             ./run.sh $gpu $env   --transfer-environment minatar \
             --total-minatar-steps 10000000 --transfer-num-envs 128 \
             --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True --reinitialise-encoder True &
@@ -66,9 +69,22 @@ for lr in "${lrs[@]}"; do
             fi
             # for random seeds
             sleep $((RANDOM % 3 + 3))
+
+            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
             ./run.sh $gpu $env   --transfer-environment minatar \
             --total-minatar-steps 10000000 --transfer-num-envs 128 \
-            --seed $i --transfer-learning-rate $lr --reinitiliase-encoder True &
+            --seed $i --transfer-learning-rate $lr --reinitialise-encoder True &
+            count=$(($count + 1))     
+            if [ $(($count % $threads)) -eq 0 ]; then
+                wait
+            fi
+            # for random seeds
+            sleep $((RANDOM % 3 + 3))
+
+            gpu=${gpus[$(($count % ${#gpus[@]}))]}  
+            ./run.sh $gpu $env   --transfer-environment minatar \
+            --total-minatar-steps 10000000 --transfer-num-envs 128 \
+            --seed $i --transfer-learning-rate $lr --transfer-only True &
             count=$(($count + 1))     
             if [ $(($count % $threads)) -eq 0 ]; then
                 wait
