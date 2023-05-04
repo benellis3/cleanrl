@@ -510,6 +510,16 @@ def log_stats(
         global_step,
     )
 
+def transform_atari_obs(obs):
+    w = obs.shape[-2]
+    h = obs.shape[-1]
+    ret_obs = jnp.zeros((obs.shape[0], 2*w, 2*h))
+    ret_obs = ret_obs.at[:, :w, :h].set(obs[:, 0])
+    ret_obs = ret_obs.at[:, w:2*w, :h].set(obs[:, 1])
+    ret_obs = ret_obs.at[:, :w, h:2*h].set(obs[:, 2])
+    ret_obs = ret_obs.at[:, w:2*w, h:2*h].set(obs[:, 3])
+    return ret_obs
+
 
 def main(args):
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -586,6 +596,8 @@ def main(args):
 
     def step_env_wrappeed(episode_stats, key, handle, action):
         handle, (next_obs, reward, next_done, info) = step_env(handle, action)
+        if args.use_clip_encoder:
+            next_obs = transform_atari_obs(next_obs)
         new_episode_return = episode_stats.episode_returns + info["reward"]
         new_episode_length = episode_stats.episode_lengths + 1
         episode_stats = episode_stats.replace(
@@ -690,7 +702,7 @@ def main(args):
         ),
     )
     atari_clip_params = atari_clip_encoder.init(
-        atari_clip_key, clip_encoder(np.array([envs.single_observation_space.sample()]))
+        atari_clip_key, clip_encoder(transform_atari_obs(np.array([envs.single_observation_space.sample()])))
     )
     minatar_actor_params = minatar_actor.init(
         minatar_actor_key,
@@ -984,7 +996,7 @@ def main(args):
 
     start_time = time.time()
     if args.transfer_environment == "atari":
-        transfer_next_obs = envs.reset()
+        transfer_next_obs = transform_atari_obs(envs.reset())
     else:
         key, reset_key = jax.random.split(key)
         transfer_next_obs, transfer_handle = permuted_minatar_envs.reset(
