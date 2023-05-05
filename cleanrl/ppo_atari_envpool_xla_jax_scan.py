@@ -29,7 +29,8 @@ from flax import struct
 import seaborn as sns
 from matplotlib import colors
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoProcessor, FlaxCLIPModel
+from transformers import FlaxCLIPModel
+from transformers.image_processing_utils import BatchFeature
 
 
 def parse_args(parser=None, prefix=None):
@@ -167,32 +168,40 @@ class ImageMinAtarWrapper(GymnaxWrapper):
         self.return_true_image = return_true_image
 
     @partial(jax.jit, static_argnums=(0,))
-    def obs_as_image(self, obs):
+    def obs_as_image(self, obs, colors):
         img = (
             jnp.amax(obs * jnp.reshape(jnp.arange(obs.shape[-1]) + 1, (1, 1, -1)), 2)
             + 0.5
         )
         if self.return_true_image:
-            img = jnp.uint8(self.cmap(self.norm(img)) * 255)
-            img = img[:, :, :3]  # ignore the A dimension, just RGB
+            img = jnp.clip(img, a_min=0, a_max=self.ncolors)
+            img = jnp.uint8(colors[jnp.uint32(img)] * 255)
         return img
 
+    def _init_cmap(self, obs):
+        self.n_channels = obs.shape[-1]
+        self.cmap = sns.color_palette("cubehelix", self.n_channels)
+        self.cmap.insert(0, (0, 0, 0))
+        self.cmap = colors.ListedColormap(self.cmap)
+        bounds = range(self.n_channels + 2)
+        self.ncolors = self.n_channels + 1
+        self.norm = colors.BoundaryNorm(bounds, self.ncolors)
+
     @partial(jax.jit, static_argnums=(0,))
-    def reset_env(self, key, params):
-        obs, state = self._env.reset_env(key, params)
+    def reset(self, key, params):
+        obs, state = self._env.reset(key, params)
         if not hasattr(self, "n_channels"):
-            self.n_channels = obs.shape[-1]
-            self.cmap = sns.color_palette("cubehelix", self.n_channels)
-            self.cmap.insert(0, (0, 0, 0))
-            self.cmap = colors.ListedColormap(self.cmap)
-            bounds = range(self.n_channels + 2)
-            self.norm = colors.BoundaryNorm(bounds, self.n_channels + 1)
-        return self.obs_as_image(obs), state
+            self._init_cmap(obs) 
+        colors = jnp.array(self.cmap.colors)
+        return self.obs_as_image(obs, colors), state
 
     @partial(jax.jit, static_argnums=(0,))
     def step_env(self, key, state, action, params):
         obs, state, reward, done, info = self._env.step_env(key, state, action, params)
-        return self.obs_as_image(obs), state, reward, done, info
+        if not hasattr(self, "n_channels"):
+            self._init_cmap(obs)
+        colors = jnp.array(self.cmap.colors)
+        return self.obs_as_image(obs, colors), state, reward, done, info
 
 
 class PermuteObservationGymnaxWrapper(GymnaxWrapper):
@@ -211,8 +220,8 @@ class PermuteObservationGymnaxWrapper(GymnaxWrapper):
         return obs.reshape(width, height, -1)
 
     @partial(jax.jit, static_argnums=(0,))
-    def reset_env(self, key, params):
-        obs, state = self._env.reset_env(key, params)
+    def reset(self, key, params):
+        obs, state = self._env.reset(key, params)
         return self.permute_obs(obs), state
 
     @partial(jax.jit, static_argnums=(0,))
@@ -260,6 +269,8 @@ class EnvPoolAutoResetWrapper(GymnaxWrapper):
         )
         return obs, state, reward, done, info
 
+    def reset(self, key, params):
+        return self._env.reset(key, params)
 
 class SignedRewardWrapper(GymnaxWrapper):
     def __init__(self, env: environment.Environment):
@@ -270,6 +281,10 @@ class SignedRewardWrapper(GymnaxWrapper):
         obs, state, reward, done, info = self._env.step_env(key, state, action, params)
         info["reward"] = reward
         return obs, state, jnp.sign(reward), done, info
+    
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, key, params):
+        return self._env.reset(key, params)
 
 
 def make_gymnax_env(env_id, num_envs, permute_obs, image_obs, permutation_key=None):
@@ -366,11 +381,25 @@ class CLIPModel:
     """Simple class that combines the image processing and model calling of clip"""
 
     def __init__(self, model_str: str):
-        self.processor = AutoProcessor.from_pretrained(model_str)
         self.model = FlaxCLIPModel.from_pretrained(model_str)
+        # from OpenAI implementation. Source known only unto god.
+        # Predictably a beige colour
+        self.image_mean = jnp.array([0.48145466, 0.4578275, 0.40821073])
+        # of similarly mysterious origin
+        self.image_std = jnp.array([0.26862954, 0.26130258, 0.27577711])
+        self.eps = 1e-6
+        self.rescale_factor = 1 / 255
 
     def __call__(self, images):
-        inputs = self.processor(images=images, return_tensors="np")
+        """MinAtar images have 3 channels but Atari has only 1, so need different means"""
+        # huggingface image conversions are written using numpy. Why there is no jax version
+        # is known only unto god. This means I had to write it myself.
+        images = jax.image.resize(images, (images.shape[0], 3, 224, 224), "bicubic")
+        images = jnp.clip(images * self.rescale_factor, a_min=0.0, a_max=1.0)
+        images = jnp.transpose(images, (0, 2, 3, 1))
+        images = (images - self.image_mean) / (self.image_std + self.eps)
+        inputs = jnp.transpose(images, (0, 3, 1, 2))
+        inputs = BatchFeature({"pixel_values": inputs}, tensor_type="jax")
         return self.model.get_image_features(**inputs)
 
 
@@ -381,7 +410,7 @@ class AtariCLIPEncoder(nn.Module):
     def __call__(self, x):
         for _ in range(self.num_layers):
             x = nn.Dense(
-                512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+                768, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
             x = nn.relu(x)
         return x
@@ -513,11 +542,15 @@ def log_stats(
 def transform_atari_obs(obs):
     w = obs.shape[-2]
     h = obs.shape[-1]
-    ret_obs = jnp.zeros((obs.shape[0], 2*w, 2*h))
-    ret_obs = ret_obs.at[:, :w, :h].set(obs[:, 0])
-    ret_obs = ret_obs.at[:, w:2*w, :h].set(obs[:, 1])
-    ret_obs = ret_obs.at[:, :w, h:2*h].set(obs[:, 2])
-    ret_obs = ret_obs.at[:, w:2*w, h:2*h].set(obs[:, 3])
+    ret_obs = jnp.zeros((obs.shape[0], 1, 2*w, 2*h))
+    ret_obs = ret_obs.at[:, :, :w, :h].set(obs[:, :1])
+    ret_obs = ret_obs.at[:, :, w:2*w, :h].set(obs[:, 1:2])
+    ret_obs = ret_obs.at[:, :, :w, h:2*h].set(obs[:, 2:3])
+    # this is needed so that there is an extra dimension to obs.
+    # obs[:, :1] will have 4 dimensions (like ret_obs.at), but 
+    # obs[: 0] will have 3.
+    ret_obs = ret_obs.at[:, :, w:2*w, h:2*h].set(obs[:, 3:4])
+    ret_obs = jnp.repeat(ret_obs, 3, axis=1)
     return ret_obs
 
 
@@ -685,43 +718,39 @@ def main(args):
         minatar_key,
         np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
     )
-    body_params = body.init(
-        body_key,
-        atari_encoder.apply(
-            atari_params, np.array([envs.single_observation_space.sample()])
-        ),
+
+    atari_clip_params = atari_clip_encoder.init(
+        atari_clip_key, clip_encoder(transform_atari_obs(np.array([envs.single_observation_space.sample()])))
     )
+    if not args.use_clip_encoder:
+        body_input = atari_encoder.apply(
+            atari_params, np.array([envs.single_observation_space.sample()])
+        )
+    else:
+        body_input = atari_clip_encoder.apply(
+            atari_clip_params, clip_encoder(transform_atari_obs(np.array([envs.single_observation_space.sample()])))
+        )
+    body_params = body.init(body_key, body_input)
     atari_actor_params = atari_actor.init(
         atari_actor_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
-                np.array([envs.single_observation_space.sample()]),
-            ),
+            body_input,
         ),
     )
-    atari_clip_params = atari_clip_encoder.init(
-        atari_clip_key, clip_encoder(transform_atari_obs(np.array([envs.single_observation_space.sample()])))
-    )
+    
     minatar_actor_params = minatar_actor.init(
         minatar_actor_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
-                np.array([envs.single_observation_space.sample()]),
-            ),
+            body_input
         ),  # just a latent sample -- not an issue it's encoded by atari
     )
     critic_params = critic.init(
         critic_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
-                np.array([envs.single_observation_space.sample()]),
-            ),
+            body_input
         ),
     )
 
@@ -746,7 +775,7 @@ def main(args):
     atari_clip_encoder.apply = jax.jit(atari_clip_encoder.apply)
     critic.apply = jax.jit(critic.apply)
 
-    @partial(jax.jit, static_argnums=(3,))
+    @partial(jax.jit, static_argnums=(3,4))
     def get_action_and_value(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -787,7 +816,7 @@ def main(args):
         value = critic.apply(agent_state.params.critic_params, hidden)
         return action, logprob, value.squeeze(1), key
 
-    @partial(jax.jit, static_argnums=(3,))
+    @partial(jax.jit, static_argnums=(3,4))
     def get_action_and_value2(
         params: flax.core.FrozenDict,
         x: np.ndarray,
@@ -837,7 +866,7 @@ def main(args):
         compute_gae_once, gamma=args.gamma, gae_lambda=args.gae_lambda
     )
 
-    @partial(jax.jit, static_argnames=["use_minatar", "use_proxy"])
+    @partial(jax.jit, static_argnames=["use_minatar", "use_clip", "use_proxy"])
     def compute_gae(
         agent_state: TrainState,
         next_obs: np.ndarray,
@@ -912,7 +941,7 @@ def main(args):
 
     ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-    @partial(jax.jit, static_argnames=["use_minatar"])
+    @partial(jax.jit, static_argnames=["use_minatar", "use_clip"])
     def update_ppo(
         agent_state: TrainState,
         storage: Storage,
