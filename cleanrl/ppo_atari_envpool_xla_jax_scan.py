@@ -115,6 +115,7 @@ def parse_args(parser=None, prefix=None):
     parser.add_argument(fmt_arg("num-body-layers"), type=int, default=2,
         help="The number of layers to put in the shared body between the actor and critic")
     parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
+    parser.add_argument(fmt_arg("permute-obs-on-transfer"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to permute the obs on transfer")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
@@ -482,7 +483,7 @@ def main(args):
     permuted_minatar_envs, permuted_minatar_env_params = make_gymnax_env(
         args.minatar_env_id,
         args.transfer_num_envs,
-        permute_obs=True,
+        permute_obs=args.permute_obs_on_transfer,
         permutation_key=permutation_key,
     )()
     permuted_minatar_step_env = partial(
