@@ -1055,7 +1055,7 @@ def main(args):
                     body_params="rest",
                     minatar_actor_params="rest",
                     atari_actor_params="encoder",
-                    critic_params="rest",
+                    critic_params="encoder",
                 ),
             )
         else:
