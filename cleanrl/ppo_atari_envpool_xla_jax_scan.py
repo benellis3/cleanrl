@@ -115,7 +115,7 @@ def parse_args(parser=None, prefix=None):
     parser.add_argument(fmt_arg("num-body-layers"), type=int, default=2,
         help="The number of layers to put in the shared body between the actor and critic")
     parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
-    parser.add_argument(fmt_arg("permute-obs-on-transfer"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to permute the obs on transfer")
+    parser.add_argument(fmt_arg("permute-obs-on-transfer"), type=lambda x: bool(strtobool(x)), default=True, help="Whether to permute the obs on transfer")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
