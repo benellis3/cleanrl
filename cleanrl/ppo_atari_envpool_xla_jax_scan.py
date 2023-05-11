@@ -1053,7 +1053,7 @@ def main(args):
                     atari_params="encoder",
                     minatar_params="encoder",
                     body_params="rest",
-                    minatar_actor_params="rest",
+                    minatar_actor_params="encoder",
                     atari_actor_params="encoder",
                     critic_params="encoder",
                 ),
@@ -1068,13 +1068,34 @@ def main(args):
                 minatar_key,
                 np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             )
+            minatar_actor_params = minatar_actor.init(
+                minatar_actor_key,
+                body.apply(
+                    body_params,
+                    atari_encoder.apply(
+                        atari_params,
+                        np.array([envs.single_observation_space.sample()]),
+                    ),
+                ),  # just a latent sample -- not an issue it's encoded by atari
+            )
+            critic_params = critic.init(
+                critic_key,
+                body.apply(
+                    body_params,
+                    atari_encoder.apply(
+                        atari_params,
+                        np.array([envs.single_observation_space.sample()]),
+                    ),
+                ),
+            )
+
             params = AgentParams(
                 atari_params=atari_params,
                 minatar_params=minatar_params,
                 body_params=agent_state.params.body_params,
                 atari_actor_params=agent_state.params.atari_actor_params,
-                minatar_actor_params=agent_state.params.minatar_actor_params,
-                critic_params=agent_state.params.critic_params,
+                minatar_actor_params=minatar_actor_params,
+                critic_params=critic_params,
             )
         else:
             params = agent_state.params
