@@ -744,7 +744,7 @@ def main(args):
             else agent_state.params.minatar_params
         )
         num_envs = args.transfer_num_envs if not use_proxy else args.minatar_num_envs
-        hidden = (encoder.apply(encoder_params, next_obs),)
+        hidden = encoder.apply(encoder_params, next_obs)
         hidden = body.apply(agent_state.params.body_params, hidden)
         next_value = critic.apply(agent_state.params.critic_params, hidden).squeeze()
 
