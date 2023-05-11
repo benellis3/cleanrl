@@ -460,8 +460,8 @@ if __name__ == "__main__":
         bc_params = AgentParams(
             minatar_params=minatar_params,
             body_params=ppo_params.body_params,
-            minatar_actor_params=ppo_params.minatar_actor_params,
-            critic_params=ppo_params.critic_params,
+            minatar_actor_params=minatar_actor_params,
+            critic_params=critic_params,
         )
     else:
         bc_params = AgentParams(
@@ -480,8 +480,8 @@ if __name__ == "__main__":
             param_labels=AgentParams(
                 minatar_params="encoder",
                 body_params="rest",
-                minatar_actor_params="rest",
-                critic_params="rest",
+                minatar_actor_params="encoder",
+                critic_params="encoder",
             ),
         )
     else:
