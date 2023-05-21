@@ -1063,7 +1063,7 @@ def main(args):
                 and avg_episodic_return > curr_score + args.score_checkpoint_interval
             ):
                 curr_score = avg_episodic_return
-                score_checkpoints[curr_score] = agent_state.params.copy()
+                score_checkpoints[curr_score] = jax.device_get(agent_state.params).copy()
     if not args.use_score_checkpoints:
         # just put in the current parameters
         score_checkpoints = {0.0: agent_state.params.copy()}
@@ -1210,9 +1210,9 @@ def main(args):
                 avg_episodic_return = np.mean(
                     jax.device_get(transfer_episode_stats.returned_episode_returns)
                 )
-                agent_state.params.body_params = vertical_lookup_fn(
+                agent_state.params.body_params = jax.device_put(vertical_lookup_fn(
                     lookup_score=avg_episodic_return
-                )
+                ))
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
