@@ -116,6 +116,12 @@ def parse_args(parser=None, prefix=None):
         help="The number of layers to put in the shared body between the actor and critic")
     parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
     parser.add_argument(fmt_arg("permute-obs-on-transfer"), type=lambda x: bool(strtobool(x)), default=True, help="Whether to permute the obs on transfer")
+    parser.add_argument(fmt_arg("use-score-checkpoints"), type=lambda x: bool(strtobool(x)), default=False,
+                        help="On transfer, transfer the body at various checkpoints, not the final weights")
+    parser.add_argument(fmt_arg("score-checkpoint-interval"), type=int, default=5,
+                        help="Interval to score checkpoints")
+    parser.add_argument(fmt_arg("lookup-largest-smaller-score"), type=lambda x: bool(strtobool(x)), default=False,
+                        help="Whether to use the largest smaller score, or the smallest larger score")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
@@ -388,6 +394,21 @@ class UpdateStats(NamedTuple):
     entropy_loss: jnp.array
     approx_kl: jnp.array
     loss: jnp.array
+
+
+def vertical_lookup(score_checkpoints, lookup_score, find_closest_smaller_score):
+    if find_closest_smaller_score:
+        if lookup_score < min(score_checkpoints.keys()):
+            raise Exception("Should always be a checkpoint for 0.0 return")
+        return score_checkpoints[
+            max([score for score in score_checkpoints.keys() if score < lookup_score])
+        ]
+    else:
+        if lookup_score > max(score_checkpoints.keys()):
+            return score_checkpoints[max(score_checkpoints.keys())]
+        return score_checkpoints[
+            min([score for score in score_checkpoints.keys() if score > lookup_score])
+        ]
 
 
 def log_stats(
@@ -963,6 +984,8 @@ def main(args):
         max_steps=args.num_steps,
     )
     if not args.transfer_only:
+        curr_score = 0.0
+        score_checkpoints = {curr_score: agent_state.params.copy()}
         for update in range(1, args.num_minatar_updates + 1):
             update_time_start = time.time()
             (
@@ -1032,15 +1055,28 @@ def main(args):
                     loss=loss,
                 ),
             )
-
-    # roll out on the transfer environment
-    # make sure to reinitialise the training state so that the
-    # optimiser state gets reset
+            avg_episodic_return = np.mean(
+                jax.device_get(minatar_episode_stats.returned_episode_returns)
+            )
+            if (
+                args.use_score_checkpoints
+                and avg_episodic_return > curr_score + args.score_checkpoint_interval
+            ):
+                curr_score = avg_episodic_return
+                score_checkpoints[curr_score] = agent_state.params.copy()
+    if not args.use_score_checkpoints:
+        # just put in the current parameters
+        score_checkpoints = {0.0: agent_state.params.copy()}
 
     if args.minatar_only and args.return_trained_params:
         return agent_state.params, minatar_encoder, body, minatar_actor
 
     if not args.minatar_only:
+        vertical_lookup_fn = partial(
+            vertical_lookup,
+            score_checkpoints=score_checkpoints,
+            find_closest_smaller_score=args.use_largest_smaller_score,
+        )
         if args.freeze_final_layers_on_transfer:
             opt = optax.multi_transform(
                 {
@@ -1088,12 +1124,12 @@ def main(args):
                     ),
                 ),
             )
-
+            transfer_params = vertical_lookup_fn(lookup_score=0.0)
             params = AgentParams(
                 atari_params=atari_params,
                 minatar_params=minatar_params,
-                body_params=agent_state.params.body_params,
-                atari_actor_params=agent_state.params.atari_actor_params,
+                body_params=transfer_params.body_params,
+                atari_actor_params=transfer_params.atari_actor_params,
                 minatar_actor_params=minatar_actor_params,
                 critic_params=critic_params,
             )
@@ -1170,6 +1206,13 @@ def main(args):
                     loss=loss,
                 ),
             )
+            if args.use_score_checkpoints:
+                avg_episodic_return = np.mean(
+                    jax.device_get(transfer_episode_stats.returned_episode_returns)
+                )
+                agent_state.params.body_params = vertical_lookup_fn(
+                    lookup_score=avg_episodic_return
+                )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
