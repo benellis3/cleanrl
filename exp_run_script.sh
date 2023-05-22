@@ -1,6 +1,6 @@
 #!/bin/bash
 # debug=
-# debug=echo
+debug=echo
 trap 'onCtrlC' INT
 
 function onCtrlC() {
@@ -24,6 +24,7 @@ times=${6:-5}
 lrs=(${lrs//,/ })
 gpus=(${gpus//,/ })
 env_ids=(${env_ids//,/ })
+checkpoint_intervals=(${checkpoint_intervals//,/ })
 
 echo "ENVS:" ${env_ids[@]}
 echo "THREADS:" $threads
@@ -39,7 +40,7 @@ for checkpoint_interval in "${checkpoint_intervals[@]}"; do
             for ((i = 0; i < times; i++)); do
                 gpu=${gpus[$(($count % ${#gpus[@]}))]}
                 group="${config}-${tag}"
-                ./run.sh $gpu $env --transfer-environment minatar \
+                $debug ./run.sh $gpu $env --transfer-environment minatar \
                     --total-minatar-steps 10000000 --transfer-num-envs 128 \
                     --seed $i --transfer-learning-rate $lr \
                     --score-checkpoint-interval $checkpoint_interval --use-score-checkpoints True --use-layer-norm True &
@@ -50,7 +51,7 @@ for checkpoint_interval in "${checkpoint_intervals[@]}"; do
                 # for random seeds
                 sleep $((RANDOM % 3 + 3))
                 gpu=${gpus[$(($count % ${#gpus[@]}))]}
-                ./run.sh $gpu $env --transfer-environment minatar \
+                $debug ./run.sh $gpu $env --transfer-environment minatar \
                     --total-minatar-steps 10000000 --transfer-num-envs 128 \
                     --seed $i --transfer-learning-rate $lr --freeze-final-layers-on-transfer True \
                     --score-checkpoint-interval $checkpoint_interval --use-score-checkpoints True --use-layer-norm True &
@@ -63,7 +64,7 @@ for checkpoint_interval in "${checkpoint_intervals[@]}"; do
 
                 gpu=${gpus[$(($count % ${#gpus[@]}))]}
                 # set a custom learning rate
-                ./run.sh $gpu $env --transfer-environment minatar \
+                $debug ./run.sh $gpu $env --transfer-environment minatar \
                     --total-minatar-steps 10000000 --transfer-num-envs 128 \
                     --seed $i --transfer-learning-rate 0.01 --freeze-final-layers-on-transfer True --reinitialise-encoder True \
                     --score-checkpoint-interval $checkpoint_interval --use-score-checkpoints True --use-layer-norm True &
@@ -75,7 +76,7 @@ for checkpoint_interval in "${checkpoint_intervals[@]}"; do
                 sleep $((RANDOM % 3 + 3))
 
                 gpu=${gpus[$(($count % ${#gpus[@]}))]}
-                ./run.sh $gpu $env --transfer-environment minatar \
+                $debug ./run.sh $gpu $env --transfer-environment minatar \
                     --total-minatar-steps 10000000 --transfer-num-envs 128 \
                     --seed $i --transfer-learning-rate $lr --reinitialise-encoder True \
                     --score-checkpoint-interval $checkpoint_interval --use-score-checkpoints True --use-layer-norm True &
@@ -87,7 +88,7 @@ for checkpoint_interval in "${checkpoint_intervals[@]}"; do
                 sleep $((RANDOM % 3 + 3))
 
                 gpu=${gpus[$(($count % ${#gpus[@]}))]}
-                ./run.sh $gpu $env --transfer-environment minatar \
+                $debug ./run.sh $gpu $env --transfer-environment minatar \
                     --total-minatar-steps 10000000 --transfer-num-envs 128 \
                     --seed $i --transfer-learning-rate $lr --transfer-only True --use-layer-norm True &
                 count=$(($count + 1))

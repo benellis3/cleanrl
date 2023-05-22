@@ -120,7 +120,7 @@ def parse_args(parser=None, prefix=None):
                         help="On transfer, transfer the body at various checkpoints, not the final weights")
     parser.add_argument(fmt_arg("score-checkpoint-interval"), type=int, default=5,
                         help="Interval to score checkpoints")
-    parser.add_argument(fmt_arg("lookup-largest-smaller-score"), type=lambda x: bool(strtobool(x)), default=False,
+    parser.add_argument(fmt_arg("use-largest-smaller-score"), type=lambda x: bool(strtobool(x)), default=False,
                         help="Whether to use the largest smaller score, or the smallest larger score")
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
@@ -985,7 +985,7 @@ def main(args):
     )
     if not args.transfer_only:
         curr_score = 0.0
-        score_checkpoints = {curr_score: agent_state.params.copy()}
+        score_checkpoints = {curr_score: jax.device_get(agent_state.params)}
         for update in range(1, args.num_minatar_updates + 1):
             update_time_start = time.time()
             (
@@ -1063,7 +1063,7 @@ def main(args):
                 and avg_episodic_return > curr_score + args.score_checkpoint_interval
             ):
                 curr_score = avg_episodic_return
-                score_checkpoints[curr_score] = jax.device_get(agent_state.params).copy()
+                score_checkpoints[curr_score] = jax.device_get(agent_state.params)
     if not args.use_score_checkpoints:
         # just put in the current parameters
         score_checkpoints = {0.0: agent_state.params.copy()}
@@ -1210,9 +1210,11 @@ def main(args):
                 avg_episodic_return = np.mean(
                     jax.device_get(transfer_episode_stats.returned_episode_returns)
                 )
-                agent_state.params.body_params = jax.device_put(vertical_lookup_fn(
-                    lookup_score=avg_episodic_return
-                ))
+                agent_state = agent_state.replace(
+                    params=agent_state.params.replace(
+                        body_params=jax.device_put(vertical_lookup_fn(lookup_score=avg_episodic_return).body_params)
+                    )
+                )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
