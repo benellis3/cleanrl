@@ -116,6 +116,7 @@ def parse_args(parser=None, prefix=None):
         help="The number of layers to put in the shared body between the actor and critic")
     parser.add_argument(fmt_arg("use-layer-norm"), type=lambda x: bool(strtobool(x)), default=False, help="Whether to use layernorm")
     parser.add_argument(fmt_arg("permute-obs-on-transfer"), type=lambda x: bool(strtobool(x)), default=True, help="Whether to permute the obs on transfer")
+    parser.add_argument(fmt_arg("network-layer-width"), type=int, default=512)
     args = parser.parse_args()
     def fmt_attr(attr: str) -> str:
         if prefix:
@@ -306,12 +307,13 @@ class AtariEncoder(nn.Module):
 
 class SharedActorCriticBody(nn.Module):
     num_layers: int
+    layer_width: int
 
     @nn.compact
     def __call__(self, x):
         for _ in range(self.num_layers):
             x = nn.Dense(
-                512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+                self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
             x = nn.relu(x)
         return x
@@ -320,13 +322,14 @@ class SharedActorCriticBody(nn.Module):
 class MinAtarEncoder(nn.Module):
     num_layers: int
     use_layer_norm: bool
+    layer_width: int
 
     @nn.compact
     def __call__(self, x):
         x = x.reshape((x.shape[0], -1))
         for _ in range(self.num_layers):
             x = nn.Dense(
-                512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+                self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
             )(x)
             if self.use_layer_norm:
                 x = nn.LayerNorm()(x)
@@ -581,9 +584,9 @@ def main(args):
 
     atari_encoder = AtariEncoder()
     minatar_encoder = MinAtarEncoder(
-        args.num_minatar_encoder_layers, args.use_layer_norm
+        args.num_minatar_encoder_layers, args.use_layer_norm, args.network_layer_width
     )
-    body = SharedActorCriticBody(args.num_body_layers)
+    body = SharedActorCriticBody(args.num_body_layers, args.network_layer_width)
     atari_actor = Actor(action_dim=envs.single_action_space.n)
     minatar_actor = Actor(action_dim=minatar_envs.action_space(env_params).n)
     critic = Critic()
@@ -963,8 +966,8 @@ def main(args):
         max_steps=args.num_steps,
     )
     if not args.transfer_only:
+        update_time_start = time.time()
         for update in range(1, args.num_minatar_updates + 1):
-            update_time_start = time.time()
             (
                 agent_state,
                 minatar_episode_stats,
@@ -1100,8 +1103,9 @@ def main(args):
         else:
             params = agent_state.params
         agent_state = TrainState.create(apply_fn=None, params=params, tx=opt)
+
+        update_time_start = time.time()
         for update in range(1, args.num_transfer_updates + 1):
-            update_time_start = time.time()
             (
                 agent_state,
                 transfer_episode_stats,
