@@ -601,16 +601,16 @@ def main(args):
 
     body_params = body.init(
         body_key,
-        atari_encoder.apply(
-            atari_params, np.array([envs.single_observation_space.sample()])
+        minatar_encoder.apply(
+            minatar_params, np.array([envs.single_observation_space.sample()])
         ),
     )
     atari_actor_params = atari_actor.init(
         atari_actor_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
+            minatar_encoder.apply(
+                minatar_params,
                 np.array([envs.single_observation_space.sample()]),
             ),
         ),
@@ -619,8 +619,8 @@ def main(args):
         minatar_actor_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
+            minatar_encoder.apply(
+                minatar_params,
                 np.array([envs.single_observation_space.sample()]),
             ),
         ),  # just a latent sample -- not an issue it's encoded by atari
