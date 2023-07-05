@@ -32,6 +32,7 @@ from pynvml import (
     nvmlDeviceGetPowerUsage,
     nvmlDeviceGetPowerManagementLimit,
     nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetUtilizationRates,
 )
 
 
@@ -453,21 +454,13 @@ def log_stats(
     )
     power_usage = nvmlDeviceGetPowerUsage(nvmlDeviceGetHandleByIndex(0))
     power_limit = nvmlDeviceGetPowerManagementLimit(nvmlDeviceGetHandleByIndex(0))
+    utilization = nvmlDeviceGetUtilizationRates(nvmlDeviceGetHandleByIndex(0))
+    writer.add_scalar("charts/gpu_power_usage", power_usage, global_step)
+    writer.add_scalar("charts/gpu_power_limit", power_limit, global_step)
     writer.add_scalar(
-        "charts/gpu_power_usage",
-        power_usage,
-        global_step
+        "charts/gpu_power_use_fraction", power_usage / power_limit, global_step
     )
-    writer.add_scalar(
-        "charts/gpu_power_limit",
-        power_limit,
-        global_step
-    )
-    writer.add_scalar(
-        "charts/gpu_power_use_fraction",
-        power_usage / power_limit,
-        global_step
-    )
+    writer.add_scaler("charts/gpu_utilization", utilization.gpu, global_step)
 
 
 def main(args):
