@@ -76,7 +76,7 @@ def parse_args(parser=None, prefix=None):
         help="The learning rate to use for the transfer environment")
     parser.add_argument(fmt_arg("transfer-num-envs"), type=int, default=8,
         help="the number of parallel game environments")
-    parser.add_argument(fmt_arg("minatar-num-envs"), type=int, default=128, 
+    parser.add_argument(fmt_arg("minatar-num-envs"), type=int, default=128,
         help="the number of parallel minatar environments to run")
     parser.add_argument(fmt_arg("num-steps"), type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
@@ -123,7 +123,7 @@ def parse_args(parser=None, prefix=None):
             return f"{prefix}_{attr}"
         else:
             return attr
-    
+
     def get_attr(attribute: str):
         return getattr(args, fmt_attr(attribute))
 
@@ -602,7 +602,7 @@ def main(args):
     body_params = body.init(
         body_key,
         minatar_encoder.apply(
-            minatar_params, np.array([envs.single_observation_space.sample()])
+            minatar_params, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
         ),
     )
     atari_actor_params = atari_actor.init(
@@ -611,7 +611,7 @@ def main(args):
             body_params,
             minatar_encoder.apply(
                 minatar_params,
-                np.array([envs.single_observation_space.sample()]),
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             ),
         ),
     )
@@ -621,7 +621,7 @@ def main(args):
             body_params,
             minatar_encoder.apply(
                 minatar_params,
-                np.array([envs.single_observation_space.sample()]),
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             ),
         ),  # just a latent sample -- not an issue it's encoded by atari
     )
@@ -629,9 +629,9 @@ def main(args):
         critic_key,
         body.apply(
             body_params,
-            atari_encoder.apply(
-                atari_params,
-                np.array([envs.single_observation_space.sample()]),
+            minatar_encoder.apply(
+                minatar_params,
+                np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
             ),
         ),
     )
