@@ -27,6 +27,12 @@ from flax.training.train_state import TrainState
 from flax import core
 from flax import struct
 from torch.utils.tensorboard import SummaryWriter
+from pynvml import (
+    nvmlInit,
+    nvmlDeviceGetPowerUsage,
+    nvmlDeviceGetPowerManagementLimit,
+    nvmlDeviceGetHandleByIndex,
+)
 
 
 def parse_args(parser=None, prefix=None):
@@ -313,7 +319,9 @@ class SharedActorCriticBody(nn.Module):
     def __call__(self, x):
         for _ in range(self.num_layers):
             x = nn.Dense(
-                self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+                self.layer_width,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
             )(x)
             x = nn.relu(x)
         return x
@@ -329,7 +337,9 @@ class MinAtarEncoder(nn.Module):
         x = x.reshape((x.shape[0], -1))
         for _ in range(self.num_layers):
             x = nn.Dense(
-                self.layer_width, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+                self.layer_width,
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
             )(x)
             if self.use_layer_norm:
                 x = nn.LayerNorm()(x)
@@ -441,9 +451,27 @@ def log_stats(
         int(num_envs * args.num_steps / (time.time() - update_time_start)),
         global_step,
     )
+    power_usage = nvmlDeviceGetPowerUsage(nvmlDeviceGetHandleByIndex(0))
+    power_limit = nvmlDeviceGetPowerManagementLimit(nvmlDeviceGetHandleByIndex(0))
+    writer.add_scalar(
+        "charts/gpu_power_usage",
+        power_usage,
+        global_step
+    )
+    writer.add_scalar(
+        "charts/gpu_power_limit",
+        power_limit,
+        global_step
+    )
+    writer.add_scalar(
+        "charts/gpu_power_use_fraction",
+        power_usage / power_limit,
+        global_step
+    )
 
 
 def main(args):
+    nvmlInit()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -602,7 +630,8 @@ def main(args):
     body_params = body.init(
         body_key,
         minatar_encoder.apply(
-            minatar_params, np.array([minatar_envs.observation_space(env_params).sample(init_key)])
+            minatar_params,
+            np.array([minatar_envs.observation_space(env_params).sample(init_key)]),
         ),
     )
     atari_actor_params = atari_actor.init(
